@@ -1,0 +1,6 @@
+domain: lab.local
+cluster_name: tp2-cluster
+# IP du poste hote sur le reseau de gestion (verifier : ip -4 a | grep 192.168.56)
+admin_ip: 192.168.56.1
+node_ips: ["192.168.56.11", "192.168.56.12"]
+timezone: Europe/Paris

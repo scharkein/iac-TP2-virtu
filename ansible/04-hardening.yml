@@ -1,0 +1,61 @@
+# Etape 4C : pare-feu a 3 niveaux. Filet de securite : si l'acces est perdu,
+# le pare-feu est arrete automatiquement au bout de 10 minutes.
+- hosts: pve
+  become: true
+  tasks:
+    - name: Filet de securite (pve-firewall stop dans 10 min)
+      ansible.builtin.command: systemd-run --unit=fw-rollback --on-active=10m /usr/sbin/pve-firewall stop
+      changed_when: true
+
+    - name: Dossier de travail
+      ansible.builtin.file:
+        path: /root/fw
+        state: directory
+
+- hosts: pve01
+  become: true
+  tasks:
+    - name: Generer cluster.fw, 100.fw, 200.fw
+      ansible.builtin.template:
+        src: "{{ item }}.j2"
+        dest: "/root/fw/{{ item }}"
+      loop: [cluster.fw, 100.fw, 200.fw]
+
+    # /etc/pve est un systeme de fichiers cluster : on copie avec cp, pas avec le module copy
+    - name: Regles VM / CT (niveau 3) puis Datacenter (niveau 1, en dernier)
+      ansible.builtin.shell: |
+        set -e
+        mkdir -p /etc/pve/firewall
+        cp /root/fw/100.fw /etc/pve/firewall/100.fw
+        cp /root/fw/200.fw /etc/pve/firewall/200.fw
+        cp /root/fw/cluster.fw /etc/pve/firewall/cluster.fw
+      args:
+        executable: /bin/bash
+
+- hosts: pve
+  become: true
+  tasks:
+    - name: Regles du noeud (niveau 2)
+      ansible.builtin.template:
+        src: host.fw.j2
+        dest: /root/fw/host.fw
+
+    - name: Installer host.fw
+      ansible.builtin.command: cp /root/fw/host.fw /etc/pve/nodes/{{ inventory_hostname }}/host.fw
+      changed_when: true
+
+    - name: Laisser le pare-feu s'appliquer
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: Acces admin toujours possible (web-UI 8006 depuis le poste admin)
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 8006
+        timeout: 30
+      delegate_to: localhost
+      become: false
+
+    - name: Acces valide, annuler le filet de securite
+      ansible.builtin.command: systemctl stop fw-rollback.timer
+      changed_when: true

@@ -1,0 +1,21 @@
+[OPTIONS]
+enable: 1
+policy_in: DROP
+policy_out: ACCEPT
+
+[IPSET admin-net]
+{{ admin_ip }}
+
+[IPSET cluster-nodes]
+{% for ip in node_ips %}
+{{ ip }}
+{% endfor %}
+
+[RULES]
+IN ACCEPT -source +admin-net -p tcp -dport 22
+IN ACCEPT -source +admin-net -p tcp -dport 8006
+IN ACCEPT -source +cluster-nodes
+
+[group sg-web]
+IN ACCEPT -p tcp -dport 80
+IN ACCEPT -p tcp -dport 443

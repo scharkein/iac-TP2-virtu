@@ -1,0 +1,17 @@
+#cloud-config
+hostname: vm-debian-01
+ssh_pwauth: true
+users:
+  - name: debian
+    groups: sudo
+    shell: /bin/bash
+    sudo: ALL=(ALL) ALL
+    lock_passwd: false
+chpasswd:
+  expire: false
+  users:
+    - { name: debian, password: "{{ guest_password }}", type: text }
+package_update: true
+packages: [qemu-guest-agent]
+runcmd:
+  - systemctl enable --now qemu-guest-agent

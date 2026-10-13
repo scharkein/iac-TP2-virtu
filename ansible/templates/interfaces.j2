@@ -1,0 +1,24 @@
+auto lo
+iface lo inet loopback
+
+auto {{ nat_if }}
+iface {{ nat_if }} inet dhcp
+
+iface {{ mgmt_if }} inet manual
+
+auto vmbr0
+iface vmbr0 inet static
+    address {{ node_ip }}/24
+    bridge-ports {{ mgmt_if }}
+    bridge-stp off
+    bridge-fd 0
+
+auto vmbr1
+iface vmbr1 inet static
+    address {{ guest_net }}.1/24
+    bridge-ports none
+    bridge-stp off
+    bridge-fd 0
+    post-up   echo 1 > /proc/sys/net/ipv4/ip_forward
+    post-up   iptables -t nat -A POSTROUTING -s {{ guest_net }}.0/24 -o {{ nat_if }} -j MASQUERADE
+    post-down iptables -t nat -D POSTROUTING -s {{ guest_net }}.0/24 -o {{ nat_if }} -j MASQUERADE

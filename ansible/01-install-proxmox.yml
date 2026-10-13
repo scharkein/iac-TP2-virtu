@@ -1,0 +1,116 @@
+# Etape 1 : Proxmox VE 8 installe par-dessus Debian 12 (methode officielle "Install on Debian")
+- hosts: pve
+  become: true
+  tasks:
+    - name: Nom d'hote
+      ansible.builtin.hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Retirer l'entree 127.0.1.1 (le FQDN doit pointer vers l'IP du noeud)
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '^127\.0\.1\.1'
+        state: absent
+
+    - name: FQDN -> IP du noeud
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '^{{ node_ip }}\s'
+        line: "{{ node_ip }} {{ inventory_hostname }}.{{ domain }} {{ inventory_hostname }}"
+
+    - name: Cle du depot Proxmox
+      ansible.builtin.get_url:
+        url: https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg
+        dest: /etc/apt/trusted.gpg.d/proxmox-release-bookworm.gpg
+        mode: "0644"
+
+    - name: Depot no-subscription (pas de depot enterprise)
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/pve-install-repo.list
+        content: "deb [arch=amd64] http://download.proxmox.com/debian/pve bookworm pve-no-subscription\n"
+
+    - name: Preseed grub-pc
+      ansible.builtin.debconf:
+        name: grub-pc
+        question: grub-pc/install_devices
+        vtype: multiselect
+        value: /dev/sda
+
+    - name: Finir une configuration dpkg interrompue
+      ansible.builtin.command: dpkg --configure -a
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      changed_when: false
+
+    - name: Mise a jour complete
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: dist
+
+    - name: Noyau Proxmox
+      ansible.builtin.apt:
+        name: proxmox-default-kernel
+      register: kernel
+
+    - name: Redemarrage sur le noyau Proxmox
+      ansible.builtin.reboot:
+      when: kernel is changed
+
+    - name: Preseed postfix
+      ansible.builtin.debconf:
+        name: postfix
+        question: "{{ item.q }}"
+        vtype: "{{ item.t }}"
+        value: "{{ item.v }}"
+      loop:
+        - { q: postfix/main_mailer_type, t: select, v: "Local only" }
+        - { q: postfix/mailname, t: string, v: "{{ inventory_hostname }}.{{ domain }}" }
+
+    - name: Paquets Proxmox VE
+      ansible.builtin.apt:
+        name: [proxmox-ve, postfix, open-iscsi, chrony]
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Retirer le noyau Debian et os-prober
+      ansible.builtin.apt:
+        name: [linux-image-amd64, "linux-image-6.1*", os-prober]
+        state: absent
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: update-grub
+      ansible.builtin.command: update-grub
+      changed_when: false
+
+    - name: Mot de passe root (connexion root@pam a la web-UI)
+      ansible.builtin.user:
+        name: root
+        password: "{{ pve_root_password | password_hash('sha512') }}"
+      no_log: true
+
+    - name: Interface NAT et interface de gestion
+      ansible.builtin.set_fact:
+        nat_if: "{{ ansible_default_ipv4.interface }}"
+        mgmt_if: "{{ ansible_interfaces | map('extract', ansible_facts) | selectattr('ipv4', 'defined') | selectattr('ipv4.address', 'equalto', node_ip) | map(attribute='device') | first }}"
+      when: "'vmbr0' not in ansible_interfaces"
+
+    - name: Reseau Proxmox (vmbr0 = gestion, vmbr1 = invites NAT)
+      ansible.builtin.template:
+        src: interfaces.j2
+        dest: /etc/network/interfaces
+        backup: true
+      when: "'vmbr0' not in ansible_interfaces"
+      register: net
+
+    - name: Redemarrage pour appliquer le reseau
+      ansible.builtin.reboot:
+      when: net is changed
+
+    - name: Web-UI joignable sur 8006
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 8006
+        timeout: 120
+      delegate_to: localhost
+      become: false

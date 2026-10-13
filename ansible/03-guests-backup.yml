@@ -1,0 +1,69 @@
+# Etape 3 et 5 : VM 100 (image cloud Debian 12), CT 200 (LXC), sauvegarde planifiee
+- hosts: pve01
+  become: true
+  tasks:
+    - name: Image cloud Debian 12
+      ansible.builtin.get_url:
+        url: https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2
+        dest: /root/debian-12-genericcloud-amd64.qcow2
+        mode: "0644"
+
+    - name: Dossier snippets
+      ansible.builtin.file:
+        path: /var/lib/vz/snippets
+        state: directory
+
+    - name: cloud-init de la VM (utilisateur debian + qemu-guest-agent)
+      ansible.builtin.template:
+        src: vm100-user.yml.j2
+        dest: /var/lib/vz/snippets/vm100-user.yml
+      no_log: true
+
+    - name: VM 100 vm-debian-01 (2 vCPU, 2048 Mo, disque 32 Go)
+      ansible.builtin.shell: |
+        set -e
+        qm create 100 --name vm-debian-01 --memory 2048 --sockets 1 --cores 2 --ostype l26 \
+          --scsihw virtio-scsi-single --net0 virtio,bridge=vmbr1,firewall=1 \
+          --agent enabled=1 --serial0 socket --vga serial0
+        qm set 100 --scsi0 local:0,import-from=/root/debian-12-genericcloud-amd64.qcow2,format=qcow2
+        qm resize 100 scsi0 32G
+        qm set 100 --ide2 local:cloudinit --boot order=scsi0 \
+          --ipconfig0 ip={{ guest_net }}.10/24,gw={{ guest_net }}.1 --nameserver 1.1.1.1 \
+          --cicustom user=local:snippets/vm100-user.yml
+        qm start 100
+      args:
+        executable: /bin/bash
+        creates: /etc/pve/qemu-server/100.conf
+
+    - name: CT 200 ct-debian-01 (template debian-12-standard, non privilegie)
+      ansible.builtin.shell: |
+        set -e
+        pveam update
+        T=$(pveam available --section system | awk '/debian-12-standard/ {print $2}' | sort -V | tail -1)
+        pveam download local "$T"
+        pct create 200 "local:vztmpl/$T" --hostname ct-debian-01 --memory 512 --swap 512 --cores 1 \
+          --rootfs local:8 --unprivileged 1 \
+          --net0 name=eth0,bridge=vmbr1,ip={{ guest_net }}.20/24,gw={{ guest_net }}.1,firewall=1 \
+          --nameserver 1.1.1.1 --password {{ guest_password | quote }} --start 1
+      args:
+        executable: /bin/bash
+        creates: /etc/pve/lxc/200.conf
+      no_log: true
+
+    - name: Tache de sauvegarde hebdomadaire (zstd, mode snapshot, 4 sauvegardes conservees)
+      ansible.builtin.shell: |
+        pvesh get /cluster/backup/tp2-weekly >/dev/null 2>&1 || \
+        pvesh create /cluster/backup --id tp2-weekly --vmid 100 --schedule 'sun 02:00' \
+          --storage local --mode snapshot --compress zstd --prune-backups keep-last=4 --enabled 1
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    # --- a lancer a la demande : ansible-playbook 03-guests-backup.yml --tags snapshot|backup-now
+    - name: Snapshot avant-modif
+      ansible.builtin.command: qm snapshot 100 avant-modif --description "Etat sain avant modification"
+      tags: [never, snapshot]
+
+    - name: Sauvegarde manuelle (vzdump)
+      ansible.builtin.command: vzdump 100 --mode snapshot --compress zstd --storage local
+      tags: [never, backup-now]

@@ -1,0 +1,74 @@
+# Etape 2 : config initiale, puis BONUS cluster 2 noeuds, puis RBAC
+- hosts: pve
+  become: true
+  tasks:
+    - name: Fuseau horaire
+      ansible.builtin.shell: |
+        [ "$(timedatectl show -p Timezone --value)" = "{{ timezone }}" ] || timedatectl set-timezone {{ timezone }}
+      changed_when: false
+
+    - name: chrony actif
+      ansible.builtin.service:
+        name: chrony
+        state: started
+        enabled: true
+
+    - name: Horloge synchronisee
+      ansible.builtin.command: timedatectl show -p NTPSynchronized --value
+      register: ntp
+      until: ntp.stdout == "yes"
+      retries: 12
+      delay: 5
+      changed_when: false
+
+    - name: Contenus du stockage local (sauvegardes, snippets, disques sur repertoire)
+      ansible.builtin.command: pvesm set local --content iso,vztmpl,backup,snippets,images,rootdir
+      changed_when: false
+
+- hosts: pve01
+  become: true
+  tasks:
+    - name: Creer le cluster (Corosync)
+      ansible.builtin.command: pvecm create {{ cluster_name }} --link0 {{ node_ip }}
+      args:
+        creates: /etc/pve/corosync.conf
+
+    - name: Empreinte TLS de pve01
+      ansible.builtin.shell: openssl x509 -in /etc/pve/local/pve-ssl.pem -noout -fingerprint -sha256 | cut -d= -f2
+      register: pve01_fp
+      changed_when: false
+
+- hosts: pve02
+  become: true
+  tasks:
+    - name: Rejoindre le cluster
+      ansible.builtin.command: >
+        pvesh create /cluster/config/join
+        --hostname {{ hostvars['pve01'].node_ip }}
+        --password {{ pve_root_password | quote }}
+        --fingerprint {{ hostvars['pve01'].pve01_fp.stdout }}
+        --link0 {{ node_ip }}
+      args:
+        creates: /etc/pve/corosync.conf
+      no_log: true
+
+- hosts: pve01
+  become: true
+  tasks:
+    - name: Quorum avec 2 noeuds
+      ansible.builtin.shell: pvecm status | grep -E 'Total votes:\s+2' && pvecm status | grep -E 'Quorate:\s+Yes'
+      register: quorum
+      until: quorum.rc == 0
+      retries: 12
+      delay: 5
+      changed_when: false
+
+    - name: RBAC - groupe, utilisateur, permission (replique sur le cluster)
+      ansible.builtin.shell: |
+        set -e
+        pveum group list | grep -q groupe-operateurs || pveum group add groupe-operateurs
+        pveum user list | grep -q operateur@pve || pveum user add operateur@pve --password {{ operateur_password | quote }} --groups groupe-operateurs
+        pveum acl modify /vms --groups groupe-operateurs --roles PVEVMUser
+      args:
+        executable: /bin/bash
+      no_log: true
