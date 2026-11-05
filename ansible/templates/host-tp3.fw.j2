@@ -1,0 +1,10 @@
+# TP3 - regles du noeud (niveau 2), genere par 07-firewall.yml
+[OPTIONS]
+enable: 1
+log_level_in: info
+
+[RULES]
+IN DROP -source +dc/dmz-servers -p tcp -dport 22,8006 -log warning
+IN ACCEPT -source +dc/admin-workstations -p tcp -dport 22
+IN ACCEPT -source +dc/admin-workstations -p tcp -dport 8006
+IN ACCEPT -source +dc/cluster-nodes

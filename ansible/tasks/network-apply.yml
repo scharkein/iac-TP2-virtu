@@ -1,0 +1,35 @@
+# Application reseau avec retour arriere automatique (5 min) si on perd l'acces.
+# Variable attendue : net_rollback_script (commandes de retour arriere).
+# Le playbook appelant doit ensuite verifier, puis : systemctl stop net-rollback.timer
+- name: Script de retour arriere
+  ansible.builtin.copy:
+    dest: /usr/local/sbin/tp3-net-rollback.sh
+    mode: "0750"
+    content: |
+      #!/bin/bash
+      {{ net_rollback_script }}
+      ifreload -a
+
+- name: Desarmer un ancien filet
+  ansible.builtin.command: systemctl stop net-rollback.timer
+  failed_when: false
+  changed_when: false
+
+- name: Armer le filet (retour arriere dans 5 min)
+  ansible.builtin.command: systemd-run --unit=net-rollback --on-active=5m /usr/local/sbin/tp3-net-rollback.sh
+  changed_when: true
+
+- name: ifreload -a (en tache de fond, la session SSH peut sauter)
+  ansible.builtin.shell: sleep 1; ifreload -a
+  async: 120
+  poll: 0
+  changed_when: true
+
+- name: Laisser le reseau se stabiliser
+  ansible.builtin.pause:
+    seconds: 15
+
+- name: Reconnexion
+  ansible.builtin.wait_for_connection:
+    delay: 2
+    timeout: 120

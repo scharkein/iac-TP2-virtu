@@ -1,0 +1,172 @@
+# TP3 - Etape 3 : routage inter-VLAN par l'hote, IPSets, Security Groups, regles invites,
+# isolation de l'administration. Meme filet de securite que le TP2 (pare-feu coupe apres 10 min).
+# Attention : ce playbook remplace le cluster.fw du TP2 (il le complete). Ne relance pas 04 apres.
+
+# --- Routeur inter-VLAN (sans lui, T1 "Web -> DB 3306" ne peut pas reussir) ---
+- hosts: pve01
+  become: true
+  tasks:
+    - name: Prerequis - etape 1 faite
+      ansible.builtin.command: grep -q '^source /etc/network/interfaces.d' /etc/network/interfaces
+      changed_when: false
+
+    - name: Interfaces vmbr0.10 / vmbr0.20 (l'hote = passerelle des VLAN)
+      ansible.builtin.template:
+        src: tp3-routing.j2
+        dest: /etc/network/interfaces.d/tp3-routing
+      register: routing
+
+    - name: ip_forward persistant
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-tp3-routing.conf
+        content: "net.ipv4.ip_forward = 1\n"
+
+    - name: ip_forward immediat
+      ansible.builtin.command: sysctl -w net.ipv4.ip_forward=1
+      changed_when: false
+
+    - name: Appliquer le reseau (avec retour arriere automatique)
+      ansible.builtin.include_tasks: tasks/network-apply.yml
+      vars:
+        net_rollback_script: "rm -f /etc/network/interfaces.d/tp3-routing"
+      when: routing is changed
+
+    - name: Verifier les interfaces routees
+      ansible.builtin.shell: ip -4 -br a | grep -E 'vmbr0\.(10|20)' | wc -l
+      register: svi
+      changed_when: false
+      failed_when: svi.stdout | int != 2
+
+    - name: Reseau valide, desarmer le filet
+      ansible.builtin.command: systemctl stop net-rollback.timer
+      failed_when: false
+      changed_when: false
+
+# --- Filet de securite pare-feu + sauvegarde de l'etat TP2 ---
+- hosts: pve
+  become: true
+  tasks:
+    - name: Desarmer un ancien filet
+      ansible.builtin.command: systemctl stop fw-rollback.timer
+      failed_when: false
+      changed_when: false
+
+    - name: Filet de securite (pve-firewall stop dans 10 min)
+      ansible.builtin.command: systemd-run --unit=fw-rollback --on-active=10m /usr/sbin/pve-firewall stop
+      changed_when: true
+
+    - name: Sauvegarde des regles existantes (etat TP2)
+      ansible.builtin.shell: |
+        mkdir -p /root/fw-pre-tp3
+        cp -an /etc/pve/firewall/. /root/fw-pre-tp3/ 2>/dev/null || true
+        cp -an /etc/pve/nodes/{{ inventory_hostname }}/host.fw /root/fw-pre-tp3/host-{{ inventory_hostname }}.fw 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Dossier de travail
+      ansible.builtin.file:
+        path: /root/fw
+        state: directory
+
+# --- Invites (niveau 3) puis Datacenter (niveau 1, en dernier) ---
+- hosts: pve01
+  become: true
+  tasks:
+    - name: Regles des invites (102 web, 101 db)
+      ansible.builtin.include_tasks: tasks/guest-firewall.yml
+
+    - name: Generer cluster.fw
+      ansible.builtin.template:
+        src: cluster-tp3.fw.j2
+        dest: /root/fw/cluster.fw
+
+    - name: Installer cluster.fw (IPSets, Security Groups, DROP DMZ -> admin)
+      ansible.builtin.shell: |
+        cmp -s /root/fw/cluster.fw /etc/pve/firewall/cluster.fw || { cp /root/fw/cluster.fw /etc/pve/firewall/cluster.fw; echo CHANGED; }
+      args:
+        executable: /bin/bash
+      register: cl
+      changed_when: "'CHANGED' in cl.stdout"
+
+# --- Noeuds (niveau 2) + validation ---
+- hosts: pve
+  become: true
+  tasks:
+    - name: Regles du noeud
+      ansible.builtin.template:
+        src: host-tp3.fw.j2
+        dest: /root/fw/host.fw
+
+    - name: Installer host.fw
+      ansible.builtin.shell: |
+        cmp -s /root/fw/host.fw /etc/pve/nodes/{{ inventory_hostname }}/host.fw || { cp /root/fw/host.fw /etc/pve/nodes/{{ inventory_hostname }}/host.fw; echo CHANGED; }
+      args:
+        executable: /bin/bash
+      register: hf
+      changed_when: "'CHANGED' in hf.stdout"
+
+    - name: Laisser le pare-feu s'appliquer
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: Syntaxe des regles (pve-firewall compile)
+      ansible.builtin.command: pve-firewall compile
+      register: comp
+      changed_when: false
+      failed_when: comp.rc != 0
+      no_log: true
+
+    - name: Acces admin toujours possible (web-UI 8006 depuis le poste admin)
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 8006
+        timeout: 30
+      delegate_to: localhost
+      become: false
+
+    - name: Acces valide, annuler le filet de securite
+      ansible.builtin.command: systemctl stop fw-rollback.timer
+      changed_when: true
+
+# --- Preuves ---
+- hosts: pve01
+  become: true
+  tasks:
+    - name: Dossier des preuves (poste local)
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+      delegate_to: localhost
+      become: false
+
+    - name: Preuves etape 3 (regles, groupes, IPSets)
+      ansible.builtin.shell: |
+        echo "### pve-firewall status"; pve-firewall status
+        echo; echo "### IPSets (Datacenter)"; pvesh get /cluster/firewall/ipset
+        for s in admin-workstations dmz-servers db-servers; do echo "-- $s"; pvesh get /cluster/firewall/ipset/$s; done
+        echo; echo "### Security Groups"; pvesh get /cluster/firewall/groups
+        for g in sec-grp-web sec-grp-db; do echo "-- $g"; pvesh get /cluster/firewall/groups/$g; done
+        echo; echo "### Regles Datacenter"; pvesh get /cluster/firewall/rules
+        echo; echo "### Regles noeud {{ inventory_hostname }}"; pvesh get /nodes/{{ inventory_hostname }}/firewall/rules
+        echo; echo "### Regles CT {{ web_vmid }}"; pvesh get /nodes/{{ inventory_hostname }}/lxc/{{ web_vmid }}/firewall/rules
+        echo; echo "### Regles VM {{ db_vmid }}"; pvesh get /nodes/{{ inventory_hostname }}/qemu/{{ db_vmid }}/firewall/rules
+        echo; echo "### Fichiers .fw"
+        for f in /etc/pve/firewall/cluster.fw /etc/pve/firewall/{{ web_vmid }}.fw /etc/pve/firewall/{{ db_vmid }}.fw /etc/pve/nodes/{{ inventory_hostname }}/host.fw; do echo "--- $f"; cat $f; done
+        echo; echo "### Test rapide : flux legitime Web -> DB (attendu : open)"
+        pct exec {{ web_vmid }} -- nc -z -v -w3 {{ db_ip }} {{ db_port }} 2>&1 || echo "KO"
+      args:
+        executable: /bin/bash
+      register: proof
+      changed_when: false
+
+    - name: Sauvegarder la preuve
+      ansible.builtin.copy:
+        content: "{{ proof.stdout }}\n"
+        dest: "{{ report_dir }}/etape3.txt"
+      delegate_to: localhost
+      become: false
+
+    - name: Resultat
+      ansible.builtin.debug:
+        var: proof.stdout_lines

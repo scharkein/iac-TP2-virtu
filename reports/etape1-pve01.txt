@@ -1,0 +1,65 @@
+### /etc/network/interfaces
+# TP3 - genere par Ansible (05-vlan-aware.yml). Sauvegarde : /etc/network/interfaces.pre-tp3
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet dhcp
+
+iface eth1 inet manual
+
+# vmbr0 : bridge VLAN-aware. Le trafic non tague (PVID 1) reste utilisable :
+# l'acces admin 192.168.56.x n'est donc pas coupe (cf. avertissement "lockout" du sujet).
+auto vmbr0
+iface vmbr0 inet static
+    address 192.168.56.11/24
+    bridge-ports eth1
+    bridge-stp off
+    bridge-fd 0
+    bridge-vlan-aware yes
+    bridge-vids 10 20 99
+
+# Gestion taguee VLAN 99 (pas de gateway : la route par defaut reste celle du NAT)
+auto vmbr0.99
+iface vmbr0.99 inet static
+    address 192.168.99.2/24
+
+auto vmbr1
+iface vmbr1 inet static
+    address 10.10.10.1/24
+    bridge-ports none
+    bridge-stp off
+    bridge-fd 0
+    post-up   echo 1 > /proc/sys/net/ipv4/ip_forward
+    post-up   iptables -t nat -A POSTROUTING -s 10.10.10.0/24 -o eth0 -j MASQUERADE
+    post-down iptables -t nat -D POSTROUTING -s 10.10.10.0/24 -o eth0 -j MASQUERADE
+
+source /etc/network/interfaces.d/*
+
+### bridge vlan show
+port              vlan-id  
+eth1              1 PVID Egress Untagged
+                  10
+                  20
+                  99
+vmbr0             1 PVID Egress Untagged
+                  99
+vmbr1             1 PVID Egress Untagged
+tap100i0          1 PVID Egress Untagged
+fwbr100i0         1 PVID Egress Untagged
+fwpr100p0         1 PVID Egress Untagged
+fwln100i0         1 PVID Egress Untagged
+veth200i0         1 PVID Egress Untagged
+fwbr200i0         1 PVID Egress Untagged
+fwpr200p0         1 PVID Egress Untagged
+fwln200i0         1 PVID Egress Untagged
+
+### ip -d link show vmbr0 (extrait)
+vlan_filtering 1
+
+### ip -4 -br a
+lo               UNKNOWN        127.0.0.1/8 
+eth0             UP             192.168.108.185/24 
+vmbr0            UP             192.168.56.11/24 
+vmbr1            UP             10.10.10.1/24 
+vmbr0.99@vmbr0   UP             192.168.99.2/24 

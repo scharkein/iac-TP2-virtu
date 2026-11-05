@@ -1,0 +1,36 @@
+# Rend 102.fw (web) et 101.fw (db) puis les installe dans /etc/pve/firewall.
+# tp3_antispoof : auto (conserve l'etat) | true | false
+- name: Anti-spoofing deja actif ?
+  ansible.builtin.shell: "grep -qs '^ipfilter: 1' /etc/pve/firewall/{{ db_vmid }}.fw"
+  register: _as
+  failed_when: false
+  changed_when: false
+
+- name: Etat anti-spoofing retenu
+  ansible.builtin.set_fact:
+    antispoof_on: "{{ (_as.rc == 0) if (tp3_antispoof | string | lower == 'auto') else (tp3_antispoof | bool) }}"
+
+- name: Dossier de travail
+  ansible.builtin.file:
+    path: /root/fw
+    state: directory
+
+- name: Rendre les .fw des invites
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "/root/fw/{{ item.vmid }}.fw"
+  loop:
+    - { src: tp3-web.fw.j2, vmid: "{{ web_vmid }}" }
+    - { src: tp3-db.fw.j2, vmid: "{{ db_vmid }}" }
+
+# /etc/pve est un systeme de fichiers cluster : cp, pas le module copy
+- name: Installer dans /etc/pve/firewall
+  ansible.builtin.shell: |
+    set -e
+    mkdir -p /etc/pve/firewall
+    cmp -s /root/fw/{{ item }}.fw /etc/pve/firewall/{{ item }}.fw || { cp /root/fw/{{ item }}.fw /etc/pve/firewall/{{ item }}.fw; echo CHANGED; }
+  args:
+    executable: /bin/bash
+  register: fwcp
+  changed_when: "'CHANGED' in fwcp.stdout"
+  loop: ["{{ web_vmid }}", "{{ db_vmid }}"]

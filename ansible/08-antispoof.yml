@@ -1,0 +1,144 @@
+# TP3 - Etape 4 : anti-usurpation IP/MAC (ipfilter-net0 + macfilter)
+# Demonstration A/B depuis le CT web : usurpation d'une autre IP du VLAN 10 vers la DB (flux 3306 autorise)
+#   AVANT ipfilter : passe  |  APRES : bloque a la source (chaine veth102i0-OUT de l'hote).
+- hosts: pve01
+  become: true
+  vars:
+    spoof_web: |
+      ip addr add 192.168.10.50/24 dev eth0 2>/dev/null
+      if nc -s 192.168.10.50 -z -w3 {{ db_ip }} {{ db_port }} >/dev/null 2>&1; then echo SPOOF_IP=PASSED; else echo SPOOF_IP=BLOCKED; fi
+      ip addr del 192.168.10.50/24 dev eth0 2>/dev/null
+      if nc -z -w3 {{ db_ip }} {{ db_port }} >/dev/null 2>&1; then echo LEGIT=OK; else echo LEGIT=KO; fi
+    spoof_mac: |
+      ORIG=$(cat /sys/class/net/eth0/address)
+      ip link set dev eth0 address 02:aa:bb:cc:dd:ee
+      if nc -z -w3 {{ db_ip }} {{ db_port }} >/dev/null 2>&1; then echo SPOOF_MAC=PASSED; else echo SPOOF_MAC=BLOCKED; fi
+      ip link set dev eth0 address $ORIG
+    spoof_vm: |
+      IF=$(ip -o -4 route show default | awk '{print $5; exit}')
+      ip addr add 192.168.99.50/24 dev $IF
+      ping -c3 -W1 -I 192.168.99.50 {{ db_gw }} >/dev/null 2>&1 && echo SPOOF_VLAN99=PASSED || echo SPOOF_VLAN99=BLOCKED
+      ip addr del 192.168.99.50/24 dev $IF
+  tasks:
+    - name: Dossier des preuves (poste local)
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+      delegate_to: localhost
+      become: false
+
+    - name: Prerequis - etape 3 faite (routage + regles invites)
+      ansible.builtin.shell: test -f /etc/pve/firewall/{{ web_vmid }}.fw && ip -4 -br a | grep -q 'vmbr0\.10'
+      changed_when: false
+
+    - name: Anti-spoofing deja actif ?
+      ansible.builtin.shell: "grep -qs '^ipfilter: 1' /etc/pve/firewall/{{ web_vmid }}.fw"
+      register: already
+      failed_when: false
+      changed_when: false
+
+    - name: AVANT - usurpation depuis le CT web (doit PASSER)
+      ansible.builtin.shell: |
+        pct exec {{ web_vmid }} -- bash -s <<'EOS'
+        {{ spoof_web }}
+        EOS
+      args:
+        executable: /bin/bash
+      register: before
+      changed_when: false
+      when: already.rc != 0
+
+    - name: Activer ipfilter-net0 + macfilter (CT web et VM DB)
+      ansible.builtin.include_tasks: tasks/guest-firewall.yml
+      vars:
+        tp3_antispoof: true
+
+    - name: Attendre l'application des regles (ipset ipfilter)
+      ansible.builtin.shell: |
+        for i in $(seq 1 30); do iptables-save | grep -q 'ipfilter-net0' && break; sleep 2; done
+        sleep 5
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Compteur DROP ipfilter VM DB (avant test)
+      ansible.builtin.shell: iptables -nvxL tap{{ db_vmid }}i0-OUT 2>/dev/null | awk '/ipfilter/ && /DROP/ {s+=$1} END {print s+0}'
+      register: c1
+      changed_when: false
+
+    - name: APRES - usurpation IP depuis le CT web (doit etre BLOQUEE)
+      ansible.builtin.shell: |
+        pct exec {{ web_vmid }} -- bash -s <<'EOS'
+        {{ spoof_web }}
+        EOS
+      args:
+        executable: /bin/bash
+      register: after
+      changed_when: false
+
+    - name: APRES - usurpation de MAC depuis le CT web (MAC pinning, doit etre BLOQUEE)
+      ansible.builtin.shell: |
+        pct exec {{ web_vmid }} -- bash -s <<'EOS'
+        {{ spoof_mac }}
+        EOS
+      args:
+        executable: /bin/bash
+      register: macres
+      changed_when: false
+
+    - name: Scenario du sujet - IP VLAN 99 forgee depuis la VM DB
+      ansible.builtin.shell: echo {{ spoof_vm | quote }} | /usr/local/sbin/tp3-vmexec {{ db_vmid }}
+      args:
+        executable: /bin/bash
+      register: vmres
+      changed_when: false
+
+    - name: Compteur DROP ipfilter VM DB (apres test)
+      ansible.builtin.shell: iptables -nvxL tap{{ db_vmid }}i0-OUT 2>/dev/null | awk '/ipfilter/ && /DROP/ {s+=$1} END {print s+0}'
+      register: c2
+      changed_when: false
+
+    - name: Preuves techniques (fichiers .fw, ipset, regles)
+      ansible.builtin.shell: |
+        echo "### /etc/pve/firewall/{{ db_vmid }}.fw"; cat /etc/pve/firewall/{{ db_vmid }}.fw
+        echo; echo "### /etc/pve/firewall/{{ web_vmid }}.fw"; cat /etc/pve/firewall/{{ web_vmid }}.fw
+        echo; echo "### iptables-save | grep ipfilter"; iptables-save -c | grep -E 'ipfilter' || true
+        echo; echo "### ipset ipfilter"; ipset list | grep -A8 -E '^Name: .*ipfilter' || true
+        echo; echo "### chaine veth{{ web_vmid }}i0-OUT"; iptables -nvxL veth{{ web_vmid }}i0-OUT 2>/dev/null | head -20 || true
+        echo; echo "### pve-firewall.log (DROP recents, VM {{ db_vmid }} / CT {{ web_vmid }})"
+        grep -E '^({{ db_vmid }}|{{ web_vmid }}) ' /var/log/pve-firewall.log | tail -n 15 || true
+      args:
+        executable: /bin/bash
+      register: tech
+      changed_when: false
+
+    - name: Synthese
+      ansible.builtin.set_fact:
+        summary: |
+          AVANT ipfilter (CT web, IP forgee 192.168.10.50 -> DB:{{ db_port }}) : {{ (before.stdout | default('(deja actif, test AVANT ignore)')) | regex_search('SPOOF_IP=\w+') | default('n/a') }}
+          APRES ipfilter  (CT web, IP forgee)                    : {{ after.stdout | regex_search('SPOOF_IP=\w+') }}
+          APRES - flux legitime Web -> DB                         : {{ after.stdout | regex_search('LEGIT=\w+') }}
+          APRES - MAC forgee (macfilter)                          : {{ macres.stdout | regex_search('SPOOF_MAC=\w+') }}
+          Scenario sujet (VM DB, IP 192.168.99.50)                : {{ vmres.stdout | regex_search('SPOOF_VLAN99=\w+') }}
+          Compteur DROP ipfilter VM DB : {{ c1.stdout | trim }} -> {{ c2.stdout | trim }}
+
+    - name: Controles
+      ansible.builtin.assert:
+        that:
+          - "'SPOOF_IP=BLOCKED' in after.stdout"
+          - "'LEGIT=OK' in after.stdout"
+          - "'SPOOF_MAC=BLOCKED' in macres.stdout"
+          - "'SPOOF_VLAN99=BLOCKED' in vmres.stdout"
+        fail_msg: "Anti-spoofing incomplet, voir la synthese ci-dessus"
+        success_msg: "Anti-spoofing valide"
+
+    - name: Sauvegarder la preuve
+      ansible.builtin.copy:
+        content: "{{ summary }}\n{{ tech.stdout }}\n"
+        dest: "{{ report_dir }}/etape4.txt"
+      delegate_to: localhost
+      become: false
+
+    - name: Resultat
+      ansible.builtin.debug:
+        msg: "{{ summary.splitlines() }}"

@@ -1,0 +1,168 @@
+# TP3 - Etape 5 : tests d'intrusion simules depuis le CT web (T1..T4) + analyse des logs pve-firewall
+# Option : --tags host-layer  -> test "defense en profondeur" : on retire temporairement le DROP sortant du CT
+#          pour que ce soit la regle du noeud/Datacenter (DMZ -> 22/8006) qui bloque, et la tracer dans le log.
+- hosts: pve01
+  become: true
+  vars:
+    mgmt_ip: "{{ mgmt_vlan_ips[inventory_hostname] }}"
+    t1_cmd: "nc -z -v -w3 {{ db_ip }} {{ db_port }}"
+    t2_cmd: "ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no root@{{ db_ip }} true"
+    t3_cmd: "curl -k -m 8 -sS -o /dev/null -w '%{http_code}' https://{{ mgmt_ip }}:8006"
+    t4_cmd: "nmap -sS -Pn -T4 --max-retries 1 --top-ports 100 {{ mgmt_ip }}"
+  tasks:
+    - name: Dossier des preuves (poste local)
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+      delegate_to: localhost
+      become: false
+
+    - name: Horodatage de debut
+      ansible.builtin.command: date '+%Y-%m-%d %H:%M:%S'
+      register: t0
+      changed_when: false
+
+    - name: T1 - Web -> DB:3306 (attendu SUCCES)
+      ansible.builtin.shell: pct exec {{ web_vmid }} -- bash -c {{ t1_cmd | quote }}
+      register: t1
+      failed_when: false
+      changed_when: false
+
+    - name: T1b - vraie requete SQL (compte app)
+      ansible.builtin.shell: pct exec {{ web_vmid }} -- env MYSQL_PWD={{ db_app_password | default('') | quote }} mariadb -h {{ db_ip }} -u app -e 'SELECT "sql_ok" AS test'
+      register: t1b
+      failed_when: false
+      changed_when: false
+      no_log: true
+
+    - name: T2 - SSH Web -> DB (attendu BLOCAGE / timeout)
+      ansible.builtin.shell: pct exec {{ web_vmid }} -- bash -c {{ t2_cmd | quote }}
+      register: t2
+      failed_when: false
+      changed_when: false
+
+    - name: T3 - curl GUI Proxmox depuis la DMZ (attendu BLOCAGE)
+      ansible.builtin.shell: pct exec {{ web_vmid }} -- bash -c {{ t3_cmd | quote }}
+      register: t3
+      failed_when: false
+      changed_when: false
+
+    - name: T4 - nmap de l'hote Proxmox depuis la DMZ (attendu tout filtered)
+      ansible.builtin.shell: pct exec {{ web_vmid }} -- bash -c {{ t4_cmd | quote }}
+      register: t4
+      failed_when: false
+      changed_when: false
+
+    - name: Verdicts
+      ansible.builtin.set_fact:
+        v1: "{{ t1.rc == 0 }}"
+        v2: "{{ t2.rc != 0 and ('timed out' in ((t2.stdout ~ t2.stderr) | lower)) }}"
+        v3: "{{ (t3.stdout | trim) == '000' }}"
+        v4: "{{ (t4.stdout is not search('(?m)^[0-9]+/tcp\\s+open')) and ('filtered' in t4.stdout) }}"
+
+    - name: Logs du pare-feu lies aux tests
+      ansible.builtin.shell: |
+        echo "### pve-firewall localnet"; pve-firewall localnet
+        echo; echo "### DROP depuis {{ web_ip }} (derniers)"
+        grep -E 'SRC={{ web_ip }} ' /var/log/pve-firewall.log | grep -E 'DROP' | tail -n 30 || true
+        echo; echo "### Tentatives vers le port 8006"
+        grep -E 'SRC={{ web_ip }} .*DPT=8006' /var/log/pve-firewall.log | tail -n 5 || true
+        echo; echo "### Regle responsable (chaine du CT, sortie)"
+        iptables -S veth{{ web_vmid }}i0-OUT 2>/dev/null | tail -n 6 || true
+        echo; echo "### Regle Datacenter/noeud DMZ -> 22,8006 (chaine PVEFW-HOST-IN)"
+        iptables -S PVEFW-HOST-IN 2>/dev/null | grep -E 'dmz-servers|8006' || true
+      args:
+        executable: /bin/bash
+      register: logs
+      changed_when: false
+
+    - name: Matrice de conformite
+      ansible.builtin.set_fact:
+        matrix: |
+          Debut des tests : {{ t0.stdout }}
+          T1  nc {{ db_ip }}:{{ db_port }}          attendu SUCCES    -> {{ 'OK' if v1 else 'ECHEC' }}   (rc={{ t1.rc }})
+          T2  ssh root@{{ db_ip }}                  attendu TIMEOUT   -> {{ 'OK' if v2 else 'ECHEC' }}   (rc={{ t2.rc }})
+          T3  curl https://{{ mgmt_ip }}:8006       attendu BLOCAGE   -> {{ 'OK' if v3 else 'ECHEC' }}   (http={{ t3.stdout | trim }})
+          T4  nmap -sS -Pn {{ mgmt_ip }}            attendu FILTERED  -> {{ 'OK' if v4 else 'ECHEC' }}
+
+    - name: Sorties brutes
+      ansible.builtin.debug:
+        msg:
+          - "T1: {{ (t1.stdout ~ t1.stderr) | trim }}"
+          - "T2: {{ (t2.stdout ~ t2.stderr) | trim }}"
+          - "T3: rc={{ t3.rc }} http={{ t3.stdout }} {{ t3.stderr | trim }}"
+          - "T4: {{ t4.stdout_lines | default([]) }}"
+
+    - name: Sauvegarder la preuve
+      ansible.builtin.copy:
+        content: |
+          {{ matrix }}
+          ----- T1
+          {{ t1.stdout }}{{ t1.stderr }}
+          ----- T1b (SQL)
+          {{ 'sql_ok' if 'sql_ok' in (t1b.stdout | default('')) else 'ECHEC' }}
+          ----- T2
+          {{ t2.stdout }}{{ t2.stderr }}
+          ----- T3
+          rc={{ t3.rc }} http={{ t3.stdout }} {{ t3.stderr }}
+          ----- T4
+          {{ t4.stdout }}
+          ----- LOGS
+          {{ logs.stdout }}
+        dest: "{{ report_dir }}/etape5.txt"
+      delegate_to: localhost
+      become: false
+
+    - name: Matrice
+      ansible.builtin.debug:
+        msg: "{{ matrix.splitlines() }}"
+
+    - name: Extrait de log
+      ansible.builtin.debug:
+        var: logs.stdout_lines
+
+    - name: Controle global
+      ansible.builtin.assert:
+        that: [v1, v2, v3, v4]
+        fail_msg: "Au moins un test ne donne pas le resultat attendu (voir la matrice)"
+
+    # ---------------------------------------------------------------- optionnel
+    - name: Test defense en profondeur (couche noeud/Datacenter)
+      tags: [never, host-layer]
+      block:
+        - name: Retirer temporairement le DROP sortant du CT web
+          ansible.builtin.include_tasks: tasks/guest-firewall.yml
+          vars:
+            web_policy_out: ACCEPT
+
+        - name: Laisser le pare-feu s'appliquer
+          ansible.builtin.pause:
+            seconds: 20
+
+        - name: curl 8006 + nmap depuis la DMZ (la regle de l'hote doit bloquer)
+          ansible.builtin.shell: |
+            pct exec {{ web_vmid }} -- bash -c {{ t3_cmd | quote }}; echo " rc=$?"
+            pct exec {{ web_vmid }} -- bash -c {{ t4_cmd | quote }} | grep -E 'filtered|open' || true
+          args:
+            executable: /bin/bash
+          register: hl
+          changed_when: false
+
+        - name: Lignes de log du noeud
+          ansible.builtin.shell: |
+            grep -E 'SRC={{ web_ip }} .*DPT=(8006|22) ' /var/log/pve-firewall.log | tail -n 5
+            echo; iptables -S PVEFW-HOST-IN | grep -E 'dmz-servers|8006'
+          args:
+            executable: /bin/bash
+          register: hl_logs
+          changed_when: false
+          failed_when: false
+
+        - name: Resultat couche hote
+          ansible.builtin.debug:
+            msg: "{{ (hl.stdout ~ '\n' ~ hl_logs.stdout).splitlines() }}"
+      always:
+        - name: Remettre policy_out DROP sur le CT web
+          ansible.builtin.include_tasks: tasks/guest-firewall.yml
+          vars:
+            web_policy_out: DROP

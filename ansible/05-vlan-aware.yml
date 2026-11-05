@@ -1,0 +1,83 @@
+# TP3 - Etape 1 : bridge vmbr0 VLAN-aware (802.1Q) + interface de gestion vmbr0.99
+# Filet : retour arriere automatique du reseau au bout de 5 min si la verification echoue.
+- hosts: pve
+  become: true
+  serial: 1
+  tasks:
+    - name: Dossier des preuves (poste local)
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Port physique de vmbr0 (interface de gestion)
+      ansible.builtin.shell: ls /sys/class/net/vmbr0/brif | grep -Ev '^(tap|veth|fwpr|fwln)' | head -n1
+      register: brif
+      changed_when: false
+      failed_when: brif.stdout == ""
+
+    - name: Faits reseau
+      ansible.builtin.set_fact:
+        nat_if: "{{ ansible_default_ipv4.interface }}"
+        mgmt_if: "{{ brif.stdout }}"
+        mgmt_vlan_ip: "{{ mgmt_vlan_ips[inventory_hostname] }}"
+
+    - name: Sauvegarde de /etc/network/interfaces (une seule fois)
+      ansible.builtin.copy:
+        src: /etc/network/interfaces
+        dest: /etc/network/interfaces.pre-tp3
+        remote_src: true
+        force: false
+
+    - name: Dossier interfaces.d
+      ansible.builtin.file:
+        path: /etc/network/interfaces.d
+        state: directory
+
+    - name: /etc/network/interfaces (VLAN-aware + vmbr0.99)
+      ansible.builtin.template:
+        src: interfaces-tp3.j2
+        dest: /etc/network/interfaces
+      register: net
+
+    - name: Appliquer le reseau (avec retour arriere automatique)
+      ansible.builtin.include_tasks: tasks/network-apply.yml
+      vars:
+        net_rollback_script: "cp /etc/network/interfaces.pre-tp3 /etc/network/interfaces"
+      when: net is changed
+
+    - name: Verification - bridge vlan show / vlan_filtering / vmbr0.99
+      ansible.builtin.shell: |
+        echo "### /etc/network/interfaces"; cat /etc/network/interfaces
+        echo; echo "### bridge vlan show"; bridge vlan show
+        echo; echo "### ip -d link show vmbr0 (extrait)"; ip -d link show vmbr0 | grep -o 'vlan_filtering [01]'
+        echo; echo "### ip -4 -br a"; ip -4 -br a
+      args:
+        executable: /bin/bash
+      register: proof
+      changed_when: false
+
+    - name: Controles
+      ansible.builtin.assert:
+        that:
+          - "'vlan_filtering 1' in proof.stdout"
+          - "('vmbr0.99' in proof.stdout) and (mgmt_vlan_ip in proof.stdout)"
+        fail_msg: "VLAN-aware ou vmbr0.99 KO : le retour arriere automatique restaurera le reseau dans 5 min."
+
+    - name: Reseau valide, desarmer le filet
+      ansible.builtin.command: systemctl stop net-rollback.timer
+      failed_when: false
+      changed_when: false
+
+    - name: Preuve pour le rapport
+      ansible.builtin.copy:
+        content: "{{ proof.stdout }}\n"
+        dest: "{{ report_dir }}/etape1-{{ inventory_hostname }}.txt"
+      delegate_to: localhost
+      become: false
+
+    - name: Resultat
+      ansible.builtin.debug:
+        var: proof.stdout_lines

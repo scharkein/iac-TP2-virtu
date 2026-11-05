@@ -1,0 +1,17 @@
+# TP3 - VM base de donnees (VLAN 20). Genere par Ansible.
+[OPTIONS]
+enable: 1
+policy_in: DROP
+policy_out: DROP
+log_level_in: info
+log_level_out: info
+{% if antispoof_on | bool %}
+ipfilter: 1
+macfilter: 1
+
+[IPSET ipfilter-net0]
+{{ db_ip }}
+{% endif %}
+
+[RULES]
+GROUP sec-grp-db

@@ -1,0 +1,36 @@
+#cloud-config
+hostname: vm-db-01
+ssh_pwauth: true
+users:
+  - name: debian
+    groups: sudo
+    shell: /bin/bash
+    sudo: ALL=(ALL) ALL
+    lock_passwd: false
+chpasswd:
+  expire: false
+  users:
+    - { name: debian, password: "{{ guest_password }}", type: text }
+write_files:
+  - path: /usr/local/sbin/tp3-provision.sh
+    permissions: "0750"
+    content: |
+      #!/bin/bash
+      # Idempotent : ne fait rien au 2e demarrage (le VLAN 20 n'a pas Internet)
+      [ -f /var/lib/tp3-provisioned ] && exit 0
+      set -e
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -qq
+      apt-get install -y -qq qemu-guest-agent mariadb-server
+      systemctl enable --now qemu-guest-agent
+      sed -i 's/^bind-address.*/bind-address = 0.0.0.0/' /etc/mysql/mariadb.conf.d/50-server.cnf
+      systemctl restart mariadb
+      mariadb <<SQL
+      CREATE DATABASE IF NOT EXISTS appdb;
+      CREATE USER IF NOT EXISTS 'app'@'{{ web_ip }}' IDENTIFIED BY '{{ db_app_password }}';
+      GRANT ALL PRIVILEGES ON appdb.* TO 'app'@'{{ web_ip }}';
+      FLUSH PRIVILEGES;
+      SQL
+      touch /var/lib/tp3-provisioned
+runcmd:
+  - [ /usr/local/sbin/tp3-provision.sh ]

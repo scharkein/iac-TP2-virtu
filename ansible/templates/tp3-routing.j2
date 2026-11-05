@@ -1,0 +1,8 @@
+# TP3 - l'hote Proxmox joue le routeur inter-VLAN (genere par 07-firewall.yml)
+auto vmbr0.10
+iface vmbr0.10 inet static
+    address {{ dmz_gw }}/24
+
+auto vmbr0.20
+iface vmbr0.20 inet static
+    address {{ db_gw }}/24

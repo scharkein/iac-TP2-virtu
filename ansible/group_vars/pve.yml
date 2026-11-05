@@ -1,0 +1,22 @@
+# --- TP3 : segmentation VLAN (charge automatiquement pour les hotes du groupe [pve]) ---
+report_dir: "{{ playbook_dir }}/../reports"     # preuves pour le rapport (captures texte)
+
+vlan_ids: [10, 20, 99]
+# IP de gestion taguee VLAN 99, une par noeud (192.168.99.2 = pve01, comme dans le sujet)
+mgmt_vlan_ips:
+  pve01: 192.168.99.2
+  pve02: 192.168.99.3
+
+dmz_net: 192.168.10.0/24
+db_net: 192.168.20.0/24
+dmz_gw: 192.168.10.1        # interface vmbr0.10 de l'hote = routeur inter-VLAN
+db_gw: 192.168.20.1         # interface vmbr0.20 de l'hote
+
+web_vmid: 102               # LXC web (VLAN 10)
+db_vmid: 101                # VM base de donnees (VLAN 20)
+web_ip: 192.168.10.10
+db_ip: 192.168.20.10
+db_port: 3306
+
+web_policy_out: DROP        # ACCEPT uniquement pour le test optionnel --tags host-layer (09)
+tp3_antispoof: auto         # auto = conserve l'etat actuel | true | false (08 le force a true)

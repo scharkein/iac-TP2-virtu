@@ -1,0 +1,17 @@
+# TP3 - LXC web (VLAN 10, DMZ). Genere par Ansible.
+[OPTIONS]
+enable: 1
+policy_in: DROP
+policy_out: {{ web_policy_out }}
+log_level_in: info
+log_level_out: info
+{% if antispoof_on | bool %}
+ipfilter: 1
+macfilter: 1
+
+[IPSET ipfilter-net0]
+{{ web_ip }}
+{% endif %}
+
+[RULES]
+GROUP sec-grp-web
