@@ -31,8 +31,9 @@ iface vmbr1 inet static
     bridge-stp off
     bridge-fd 0
     post-up   echo 1 > /proc/sys/net/ipv4/ip_forward
-    post-up   iptables -t nat -A POSTROUTING -s 10.10.10.0/24 -o eth0 -j MASQUERADE
-    post-down iptables -t nat -D POSTROUTING -s 10.10.10.0/24 -o eth0 -j MASQUERADE
+    # Etat idempotent : supprimer les doublons eventuels, puis garantir une seule regle.
+    post-up   while iptables -t nat -C POSTROUTING -s 10.10.10.0/24 -o eth0 -j MASQUERADE 2>/dev/null; do iptables -t nat -D POSTROUTING -s 10.10.10.0/24 -o eth0 -j MASQUERADE; done; iptables -t nat -A POSTROUTING -s 10.10.10.0/24 -o eth0 -j MASQUERADE
+    post-down while iptables -t nat -C POSTROUTING -s 10.10.10.0/24 -o eth0 -j MASQUERADE 2>/dev/null; do iptables -t nat -D POSTROUTING -s 10.10.10.0/24 -o eth0 -j MASQUERADE; done
 
 source /etc/network/interfaces.d/*
 
@@ -53,13 +54,17 @@ veth200i0         1 PVID Egress Untagged
 fwbr200i0         1 PVID Egress Untagged
 fwpr200p0         1 PVID Egress Untagged
 fwln200i0         1 PVID Egress Untagged
+tap101i0          1 PVID Egress Untagged
+fwbr101i0         1 PVID Egress Untagged
+fwpr101p0         1 PVID Egress Untagged
+fwln101i0         1 PVID Egress Untagged
 
 ### ip -d link show vmbr0 (extrait)
 vlan_filtering 1
 
 ### ip -4 -br a
 lo               UNKNOWN        127.0.0.1/8 
-eth0             UP             192.168.108.185/24 
+eth0             UP             192.168.108.193/24 
 vmbr0            UP             192.168.56.11/24 
 vmbr1            UP             10.10.10.1/24 
 vmbr0.99@vmbr0   UP             192.168.99.2/24 

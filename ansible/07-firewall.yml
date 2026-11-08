@@ -92,6 +92,7 @@
 # --- Noeuds (niveau 2) + validation ---
 - hosts: pve
   become: true
+  serial: 1
   tasks:
     - name: Regles du noeud
       ansible.builtin.template:
@@ -105,6 +106,50 @@
         executable: /bin/bash
       register: hf
       changed_when: "'CHANGED' in hf.stdout"
+
+    # Le .fw, cluster.fw et host.fw sont maintenant tous presents. On peut activer
+    # le filtrage des interfaces sans exposer les invites a une politique incomplete.
+    - name: Activer le firewall sur la VM DB apres installation de 101.fw
+      ansible.builtin.shell: |
+        set -euo pipefail
+        NET=$(qm config {{ db_vmid }} | sed -n 's/^net0: //p')
+        MAC=$(printf '%s\n' "$NET" | sed -n 's/^virtio=\([^,]*\).*/\1/p')
+        test -n "$MAC"
+        if ! printf '%s\n' "$NET" | grep -q 'firewall=1'; then
+          qm set {{ db_vmid }} --net0 "virtio=$MAC,bridge=vmbr0,tag=20,firewall=1"
+          echo CHANGED
+        fi
+      args:
+        executable: /bin/bash
+      register: db_fw_enable
+      changed_when: "'CHANGED' in db_fw_enable.stdout"
+      when: inventory_hostname == 'pve01'
+
+    - name: Activer le firewall sur le CT Web apres installation de 102.fw
+      ansible.builtin.shell: |
+        set -euo pipefail
+        NET=$(pct config {{ web_vmid }} | sed -n 's/^net0: //p')
+        test -n "$NET"
+        if ! printf '%s\n' "$NET" | grep -q 'firewall=1'; then
+          pct set {{ web_vmid }} --net0 name=eth0,bridge=vmbr0,tag=10,ip={{ web_ip }}/24,gw={{ dmz_gw }},firewall=1
+          echo CHANGED
+        fi
+      args:
+        executable: /bin/bash
+      register: web_fw_enable
+      changed_when: "'CHANGED' in web_fw_enable.stdout"
+      when: inventory_hostname == 'pve01'
+
+    - name: Recharger pve-firewall pour appliquer les politiques et creer les chaines des invites
+      ansible.builtin.command: pve-firewall restart
+      changed_when: true
+      when: >-
+        hf is changed or
+        (hostvars['pve01'].cl is changed) or
+        (inventory_hostname == 'pve01' and
+         (hostvars['pve01'].fwcp is changed or
+          hostvars['pve01'].db_fw_enable is changed or
+          hostvars['pve01'].web_fw_enable is changed))
 
     - name: Laisser le pare-feu s'appliquer
       ansible.builtin.pause:

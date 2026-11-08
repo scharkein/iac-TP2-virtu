@@ -1,9 +1,26 @@
-# TP3 - Etape 2 : LXC web (102, VLAN 10) et VM base de donnees (101, VLAN 20)
-# Les invites sont d'abord installes sur vmbr1 (NAT, Internet), puis bascules sur vmbr0 + tag VLAN.
-- hosts: pve01
+# TP3 - Etape 2 : VM DB 101 (VLAN 20) et CT Web 102 (VLAN 10)
+#
+# Architecture :
+#   1. Les invites demarrent sur vmbr1 (NAT/Internet).
+#   2. La VM DB est configuree depuis le poste de controle par SSH via ProxyCommand
+#      (poste -> pve01 -> 10.10.10.40). QEMU Guest Agent n'est PAS utilise pour
+#      le provisioning ; il est installe pour l'exploitation ulterieure.
+#   3. Une fois MariaDB valide, la VM passe sur vmbr0 tag 20.
+#   4. Le CT Web est installe sur vmbr1, puis passe sur vmbr0 tag 10.
+#
+# Premiere execution apres l'ancien 06 :
+#   ansible-playbook -e @secrets.yml 06-workloads.yml -e tp3_recreate_db_vm=true
+# Cela supprime uniquement la VM 101 existante pour la recreer avec la cle SSH.
+# Ne pas activer cette option apres que la VM contient des donnees a conserver.
+
+- name: Creer la VM DB sur le reseau temporaire
+  hosts: pve01
   become: true
+  gather_facts: false
   vars:
     cloud_img: /root/debian-12-genericcloud-amd64.qcow2
+    db_bootstrap_ip: "{{ guest_net }}.40"
+    tp3_recreate_db_vm: false
   tasks:
     - name: Dossier des preuves (poste local)
       ansible.builtin.file:
@@ -12,177 +29,513 @@
       delegate_to: localhost
       become: false
 
-    - name: Variable db_app_password definie (secrets.yml)
-      ansible.builtin.assert:
-        that: db_app_password is defined
-        fail_msg: "Ajoute db_app_password dans secrets.yml (voir secrets.yml.example)."
+    - name: Verifier la presence de la cle publique SSH locale
+      ansible.builtin.stat:
+        path: "{{ lookup('env', 'HOME') }}/.ssh/tp3_vm.pub"
+      register: tp3_pubkey_stat
+      delegate_to: localhost
+      become: false
 
-    - name: Etape 1 faite (bridge VLAN-aware)
-      ansible.builtin.shell: ip -d link show vmbr0 | grep -q 'vlan_filtering 1'
+    - name: Refuser de continuer sans cle publique SSH
+      ansible.builtin.assert:
+        that:
+          - tp3_pubkey_stat.stat.exists
+        fail_msg: >-
+          Cle SSH absente. Cree-la sur le poste de controle avec :
+          ssh-keygen -t ed25519 -f ~/.ssh/tp3_vm
+      delegate_to: localhost
+      become: false
+
+    - name: Charger la cle publique SSH du poste de controle
+      ansible.builtin.set_fact:
+        tp3_vm_ssh_pubkey: "{{ lookup('file', lookup('env', 'HOME') + '/.ssh/tp3_vm.pub') }}"
+
+    - name: Verifier le secret SQL
+      ansible.builtin.assert:
+        that:
+          - db_app_password is defined
+          - db_app_password | length >= 12
+        fail_msg: "Definis db_app_password (au moins 12 caracteres) dans secrets.yml."
+
+    - name: Verifier vmbr0 VLAN-aware et vmbr1
+      ansible.builtin.shell: |
+        set -e
+        ip -d link show vmbr0 | grep -q 'vlan_filtering 1'
+        ip -4 -o addr show dev vmbr1 | grep -qF '{{ guest_net }}.1/24'
+        test "$(cat /proc/sys/net/ipv4/ip_forward)" = 1
+      args:
+        executable: /bin/bash
       changed_when: false
 
-    - name: Outil d'execution dans les VM (qemu-guest-agent)
+    - name: Garantir une unique regle NAT pour le reseau temporaire (idempotent)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        NAT_IF=$(ip -4 route show default | awk 'NR == 1 {print $5}')
+        test -n "$NAT_IF"
+        RULE="-s {{ guest_net }}.0/24 -o $NAT_IF -j MASQUERADE"
+        COUNT=$(iptables -t nat -S POSTROUTING | grep -F -- "$RULE" | wc -l)
+        while [ "$COUNT" -gt 1 ]; do
+          iptables -t nat -D POSTROUTING $RULE
+          COUNT=$((COUNT - 1))
+          echo CHANGED
+        done
+        if [ "$COUNT" -eq 0 ]; then
+          iptables -t nat -A POSTROUTING $RULE
+          echo CHANGED
+        fi
+      args:
+        executable: /bin/bash
+      register: nat_rule
+      changed_when: "'CHANGED' in nat_rule.stdout"
+
+    - name: Installer le helper QEMU Guest Agent (utilise par l'etape 08)
       ansible.builtin.copy:
         src: tp3-vmexec.sh
         dest: /usr/local/sbin/tp3-vmexec
+        owner: root
+        group: root
         mode: "0755"
 
-    - name: Image cloud Debian 12
+    - name: Telecharger l'image cloud Debian 12
       ansible.builtin.get_url:
         url: https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2
         dest: "{{ cloud_img }}"
         mode: "0644"
+        timeout: 60
 
-    - name: Dossier snippets
+    - name: Creer le dossier snippets
       ansible.builtin.file:
         path: /var/lib/vz/snippets
         state: directory
 
-    - name: cloud-init de la VM DB (MariaDB + qemu-guest-agent)
+    - name: Generer le cloud-init SSH (sans installation APT)
       ansible.builtin.template:
         src: vm-db-user.yml.j2
         dest: /var/lib/vz/snippets/vm-db-user.yml
+        mode: "0600"
       no_log: true
 
-    # ------------------------------------------------------------------ VM DB
-    - name: VM {{ db_vmid }} vm-db-01 (installee sur vmbr1)
+    - name: Lire la configuration existante de la VM DB
+      ansible.builtin.command: "qm config {{ db_vmid }}"
+      register: db_existing_config
+      changed_when: false
+      failed_when: false
+
+    - name: Supprimer explicitement l'ancienne VM DB (option de migration)
       ansible.builtin.shell: |
         set -e
+        qm stop {{ db_vmid }} --skiplock 1 2>/dev/null || true
+        qm destroy {{ db_vmid }} --purge 1 --destroy-unreferenced-disks 1
+      args:
+        executable: /bin/bash
+      when:
+        - tp3_recreate_db_vm | bool
+        - db_existing_config.rc == 0
+
+    - name: Recalculer la presence de la VM DB apres eventuelle suppression
+      ansible.builtin.command: "qm config {{ db_vmid }}"
+      register: db_config_after_cleanup
+      changed_when: false
+      failed_when: false
+
+    - name: Identifier si la VM est deja sur son VLAN definitif
+      ansible.builtin.set_fact:
+        db_vm_final_vlan: >-
+          {{ db_config_after_cleanup.rc == 0 and
+             (db_config_after_cleanup.stdout is search('(?m)^net0:.*tag=20')) }}
+
+    - name: Corriger sans destruction le firewall de la VM DB temporaire
+      ansible.builtin.shell: |
+        set -euo pipefail
+        NET=$(qm config {{ db_vmid }} | sed -n 's/^net0: //p')
+        MAC=$(printf '%s\n' "$NET" | sed -n 's/^virtio=\([^,]*\).*/\1/p')
+        test -n "$MAC"
+        if ! printf '%s\n' "$NET" | grep -q 'firewall=0'; then
+          qm set {{ db_vmid }} --net0 "virtio=$MAC,bridge=vmbr1,firewall=0"
+          echo CHANGED
+        fi
+      args:
+        executable: /bin/bash
+      register: db_bootstrap_nic
+      changed_when: "'CHANGED' in db_bootstrap_nic.stdout"
+      when: db_config_after_cleanup.rc == 0 and not (db_vm_final_vlan | bool)
+
+    - name: Creer la VM DB si elle n'existe pas encore
+      ansible.builtin.shell: |
+        set -euo pipefail
         qm create {{ db_vmid }} --name vm-db-01 --memory 1024 --sockets 1 --cores 2 --ostype l26 \
-          --scsihw virtio-scsi-single --net0 virtio,bridge=vmbr1,firewall=1 \
+          --scsihw virtio-scsi-single --net0 virtio,bridge=vmbr1,firewall=0 \
           --agent enabled=1 --serial0 socket --vga serial0
         qm set {{ db_vmid }} --scsi0 local:0,import-from={{ cloud_img }},format=qcow2
         qm resize {{ db_vmid }} scsi0 16G
         qm set {{ db_vmid }} --ide2 local:cloudinit --boot order=scsi0 \
-          --ipconfig0 ip={{ guest_net }}.40/24,gw={{ guest_net }}.1 --nameserver 1.1.1.1 \
+          --ipconfig0 ip={{ db_bootstrap_ip }}/24,gw={{ guest_net }}.1 --nameserver 1.1.1.1 \
           --cicustom user=local:snippets/vm-db-user.yml
+        qm cloudinit update {{ db_vmid }}
         qm start {{ db_vmid }}
       args:
         executable: /bin/bash
         creates: "/etc/pve/qemu-server/{{ db_vmid }}.conf"
+      when:
+        - db_config_after_cleanup.rc != 0
+        - not (db_vm_final_vlan | bool)
 
-    - name: Attendre la fin du provisioning cloud-init (MariaDB, ~3-5 min)
-      block:
-        - name: Pre-controle - sortie Internet de vmbr1 (NAT)
-          ansible.builtin.shell: |
-            set -e
-            ip -br a show vmbr1 | grep -qF "{{ guest_net }}.1/24"
-            [ "$(cat /proc/sys/net/ipv4/ip_forward)" = "1" ]
-            iptables -t nat -S POSTROUTING | grep -q MASQUERADE
-          args:
-            executable: /bin/bash
-          changed_when: false
+    - name: Lire le statut de la VM DB
+      ansible.builtin.command: "qm status {{ db_vmid }}"
+      register: db_status_before_boot
+      changed_when: false
+      when: not (db_vm_final_vlan | bool)
 
-        - name: Attente du provisioning (max 15 min)
-          ansible.builtin.shell: |
-            for i in $(seq 1 90); do
-              if echo 'test -f /var/lib/tp3-provisioned' | /usr/local/sbin/tp3-vmexec {{ db_vmid }} >/dev/null 2>&1; then exit 0; fi
-              sleep 10
-            done
-            echo "provisioning de la VM {{ db_vmid }} non termine" >&2; exit 1
-          args:
-            executable: /bin/bash
-          changed_when: false
-      rescue:
-        - name: Diagnostic
-          ansible.builtin.shell: |
-            echo "### qm status"; qm status {{ db_vmid }}
-            echo "### agent"; qm agent {{ db_vmid }} ping 2>&1
-            echo "### vmbr"; ip -br a | grep vmbr
-            echo "### nat"; iptables -t nat -S POSTROUTING; cat /proc/sys/net/ipv4/ip_forward
-            echo "### interfaces"; grep -n -A8 'iface vmbr1' /etc/network/interfaces
-            echo "### firewall"; pve-firewall status
-          args:
-            executable: /bin/bash
-          register: diag
-          changed_when: false
-          failed_when: false
+    - name: Demarrer la VM DB si elle est arretee
+      ansible.builtin.command: "qm start {{ db_vmid }}"
+      when:
+        - not (db_vm_final_vlan | bool)
+        - "'status: stopped' in db_status_before_boot.stdout"
+      changed_when: true
 
-        - name: Afficher le diagnostic
-          ansible.builtin.debug:
-            var: diag.stdout_lines
+    - name: Afficher les parametres de connexion SSH de la VM
+      ansible.builtin.debug:
+        msg:
+          - "VM DB temporaire : {{ db_bootstrap_ip }}"
+          - "Connexion via pve01 : {{ ansible_host }}"
+          - "Cle publique injectee par cloud-init."
+      when: not (db_vm_final_vlan | bool)
 
-        - name: Echec
-          ansible.builtin.fail:
-            msg: "VM {{ db_vmid }} non provisionnee : voir le diagnostic (NAT vmbr1, agent, pare-feu). Console : qm terminal {{ db_vmid }}"
+- name: Provisionner MariaDB par SSH depuis le poste de controle
+  hosts: vmdb
+  become: true
+  gather_facts: false
+  vars:
+    web_ip: "{{ hostvars['pve01']['web_ip'] }}"
+  tasks:
+    - name: Attendre SSH sur la VM DB (maximum 10 minutes)
+      ansible.builtin.wait_for_connection:
+        delay: 5
+        sleep: 5
+        connect_timeout: 5
+        timeout: 600
+      when: not (hostvars['pve01']['db_vm_final_vlan'] | bool)
 
-    - name: Basculer la VM DB sur vmbr0, VLAN 20, IP 192.168.20.10
+    - name: Attendre la fin des operations cloud-init
+      ansible.builtin.command: cloud-init status --wait
+      async: 660
+      poll: 10
+      when: not (hostvars['pve01']['db_vm_final_vlan'] | bool)
+
+    - name: Mettre a jour le cache APT (delai borne et diagnostic explicite)
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - "240"
+          - apt-get
+          - -o
+          - Acquire::http::Timeout=20
+          - -o
+          - Acquire::https::Timeout=20
+          - -o
+          - Acquire::Retries=2
+          - update
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: apt_update
+      changed_when: false
+      retries: 2
+      delay: 10
+      until: apt_update.rc == 0
+      when: not (hostvars['pve01']['db_vm_final_vlan'] | bool)
+
+    - name: Installer MariaDB, PyMySQL et QEMU Guest Agent
+      ansible.builtin.apt:
+        name:
+          - mariadb-server
+          - python3-pymysql
+          - qemu-guest-agent
+        state: present
+        update_cache: false
+        lock_timeout: 300
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      when: not (hostvars['pve01']['db_vm_final_vlan'] | bool)
+
+    - name: Configurer MariaDB pour ecouter sur le reseau
+      ansible.builtin.lineinfile:
+        path: /etc/mysql/mariadb.conf.d/50-server.cnf
+        regexp: '\s*bind-address\s*='
+        line: 'bind-address = 0.0.0.0'
+        backup: true
+      notify: Redemarrer MariaDB
+      when: not (hostvars['pve01']['db_vm_final_vlan'] | bool)
+
+    - name: Activer et demarrer MariaDB
+      ansible.builtin.service:
+        name: mariadb
+        state: started
+        enabled: true
+      when: not (hostvars['pve01']['db_vm_final_vlan'] | bool)
+
+    - name: Activer et demarrer QEMU Guest Agent
+      ansible.builtin.service:
+        name: qemu-guest-agent
+        state: started
+        enabled: true
+      when: not (hostvars['pve01']['db_vm_final_vlan'] | bool)
+
+    - name: Creer la base appdb
+      community.mysql.mysql_db:
+        name: appdb
+        state: present
+        login_unix_socket: /run/mysqld/mysqld.sock
+        login_user: root
+      when: not (hostvars['pve01']['db_vm_final_vlan'] | bool)
+
+    - name: Creer le compte SQL applicatif limite au CT Web
+      community.mysql.mysql_user:
+        name: app
+        host: "{{ web_ip }}"
+        password: "{{ db_app_password }}"
+        priv: "appdb.*:ALL"
+        state: present
+        login_unix_socket: /run/mysqld/mysqld.sock
+        login_user: root
+      no_log: true
+      when: not (hostvars['pve01']['db_vm_final_vlan'] | bool)
+
+    - name: Verifier que MariaDB repond localement
+      ansible.builtin.command: mariadb-admin ping
+      changed_when: false
+      when: not (hostvars['pve01']['db_vm_final_vlan'] | bool)
+
+  handlers:
+    - name: Redemarrer MariaDB
+      ansible.builtin.service:
+        name: mariadb
+        state: restarted
+
+- name: Basculer la VM DB sur VLAN 20 et creer le CT Web
+  hosts: pve01
+  become: true
+  gather_facts: false
+  vars:
+    db_bootstrap_ip: "{{ guest_net }}.40"
+  tasks:
+    - name: Attendre que le QEMU Guest Agent reponde avant la bascule
+      ansible.builtin.command: "qm agent {{ db_vmid }} ping"
+      register: qga_ping
+      until: qga_ping.rc == 0
+      retries: 30
+      delay: 5
+      changed_when: false
+      when: not (db_vm_final_vlan | bool)
+
+    - name: Arreter proprement la VM DB avant le changement de reseau
+      ansible.builtin.command: "qm shutdown {{ db_vmid }} --timeout 90"
+      register: db_shutdown
+      failed_when: false
+      changed_when: false
+      when: not (db_vm_final_vlan | bool)
+
+    - name: Verifier le statut de la VM apres shutdown
+      ansible.builtin.command: "qm status {{ db_vmid }}"
+      register: db_status_after_shutdown
+      changed_when: false
+      when: not (db_vm_final_vlan | bool)
+
+    - name: Forcer l'arret si la VM ne s'est pas arretee
+      ansible.builtin.command: "qm stop {{ db_vmid }}"
+      when:
+        - not (db_vm_final_vlan | bool)
+        - "'status: running' in db_status_after_shutdown.stdout"
+      changed_when: true
+
+    - name: Mettre a jour le reseau cloud-init et le bridge de la VM DB
       ansible.builtin.shell: |
         set -e
-        if qm config {{ db_vmid }} | grep -q '^net0:.*tag=20'; then echo already; exit 0; fi
         MAC=$(qm config {{ db_vmid }} | sed -n 's/^net0: virtio=\([^,]*\),.*/\1/p')
-        qm shutdown {{ db_vmid }} --timeout 90 || qm stop {{ db_vmid }}
-        qm set {{ db_vmid }} --net0 virtio=$MAC,bridge=vmbr0,tag=20,firewall=1 \
+        test -n "$MAC"
+        qm set {{ db_vmid }} --net0 virtio=$MAC,bridge=vmbr0,tag=20,firewall=0 \
           --ipconfig0 ip={{ db_ip }}/24,gw={{ db_gw }}
+        qm cloudinit update {{ db_vmid }}
         qm start {{ db_vmid }}
-        for i in $(seq 1 40); do qm agent {{ db_vmid }} ping >/dev/null 2>&1 && exit 0; sleep 5; done
-        echo "agent invite injoignable apres bascule" >&2; exit 1
       args:
         executable: /bin/bash
-      register: dbmove
-      changed_when: "'already' not in dbmove.stdout"
+      when: not (db_vm_final_vlan | bool)
+
+    - name: Attendre le QEMU Guest Agent apres la bascule
+      ansible.builtin.command: "qm agent {{ db_vmid }} ping"
+      register: qga_final
+      until: qga_final.rc == 0
+      retries: 40
+      delay: 5
+      changed_when: false
 
     # ------------------------------------------------------------------ CT web
-    - name: CT {{ web_vmid }} ct-web-01 (installe sur vmbr1)
+    - name: Lire la configuration du CT Web
+      ansible.builtin.command: "pct config {{ web_vmid }}"
+      register: web_existing_config
+      changed_when: false
+      failed_when: false
+
+    - name: Identifier si le CT est deja sur le VLAN 10
+      ansible.builtin.set_fact:
+        web_ct_final_vlan: >-
+          {{ web_existing_config.rc == 0 and
+             (web_existing_config.stdout is search('(?m)^net0:.*tag=10')) }}
+
+    - name: Corriger sans destruction le firewall du CT Web temporaire
+      ansible.builtin.shell: |
+        set -euo pipefail
+        NET=$(pct config {{ web_vmid }} | sed -n 's/^net0: //p')
+        test -n "$NET"
+        if ! printf '%s\n' "$NET" | grep -q 'firewall=0'; then
+          pct set {{ web_vmid }} --net0 name=eth0,bridge=vmbr1,ip={{ guest_net }}.30/24,gw={{ guest_net }}.1,firewall=0
+          echo CHANGED
+        fi
+      args:
+        executable: /bin/bash
+      register: web_bootstrap_nic
+      changed_when: "'CHANGED' in web_bootstrap_nic.stdout"
+      when: web_existing_config.rc == 0 and not (web_ct_final_vlan | bool)
+
+    - name: Trouver un template Debian 12 deja present
+      ansible.builtin.shell: |
+        pveam list local | awk '/debian-12-standard/ {print $1}' | sort -V | tail -1
+      register: ct_template
+      changed_when: false
+      when: not (web_ct_final_vlan | bool)
+
+    - name: Mettre a jour le catalogue des templates si necessaire
+      ansible.builtin.command: timeout 180 pveam update
+      when:
+        - not (web_ct_final_vlan | bool)
+        - ct_template.stdout | trim == ""
+      changed_when: true
+
+    - name: Rechercher le template Debian 12 apres mise a jour
+      ansible.builtin.shell: |
+        pveam available --section system |
+          awk '/debian-12-standard/ {print $2}' | sort -V | tail -1
+      register: ct_template_available
+      changed_when: false
+      when:
+        - not (web_ct_final_vlan | bool)
+        - ct_template.stdout | trim == ""
+
+    - name: Telecharger le template Debian 12 si necessaire
+      ansible.builtin.command: "timeout 300 pveam download local {{ ct_template_available.stdout | trim }}"
+      when:
+        - not (web_ct_final_vlan | bool)
+        - ct_template.stdout | trim == ""
+        - ct_template_available.stdout | trim != ""
+      changed_when: true
+
+    - name: Definir le template LXC a utiliser
+      ansible.builtin.set_fact:
+        ct_template_path: >-
+          {{ ct_template.stdout | trim if (ct_template.stdout | trim != '')
+             else 'local:vztmpl/' ~ (ct_template_available.stdout | trim) }}
+      when: not (web_ct_final_vlan | bool)
+
+    - name: Verifier que le template LXC existe
+      ansible.builtin.assert:
+        that:
+          - ct_template_path is defined
+          - ct_template_path | length > 10
+        fail_msg: "Impossible de trouver/telecharger le template Debian 12 standard."
+      when: not (web_ct_final_vlan | bool)
+
+    - name: Creer le CT Web sur vmbr1 s'il n'existe pas
       ansible.builtin.shell: |
         set -e
-        T=$(pveam list local | awk '/debian-12-standard/ {print $1}' | sort -V | tail -1)
-        if [ -z "$T" ]; then
-          pveam update
-          N=$(pveam available --section system | awk '/debian-12-standard/ {print $2}' | sort -V | tail -1)
-          pveam download local "$N"
-          T="local:vztmpl/$N"
-        fi
-        pct create {{ web_vmid }} "$T" --hostname ct-web-01 --memory 512 --swap 512 --cores 1 \
+        pct create {{ web_vmid }} {{ ct_template_path }} --hostname ct-web-01 --memory 512 --swap 512 --cores 1 \
           --rootfs local:8 --unprivileged 1 \
-          --net0 name=eth0,bridge=vmbr1,ip={{ guest_net }}.30/24,gw={{ guest_net }}.1,firewall=1 \
-          --nameserver 1.1.1.1 --password {{ guest_password | quote }} --start 1
+          --net0 name=eth0,bridge=vmbr1,ip={{ guest_net }}.30/24,gw={{ guest_net }}.1,firewall=0 \
+          --nameserver 1.1.1.1 --password {{ guest_password | quote }}
       args:
         executable: /bin/bash
         creates: "/etc/pve/lxc/{{ web_vmid }}.conf"
       no_log: true
+      when: not (web_existing_config.rc == 0)
 
-    - name: Installer nginx et les outils de test dans le CT web
+    - name: Lire le statut du CT Web
+      ansible.builtin.command: "pct status {{ web_vmid }}"
+      register: web_status_before_boot
+      changed_when: false
+      when: not (web_ct_final_vlan | bool)
+
+    - name: Demarrer le CT Web s'il est arrete
+      ansible.builtin.command: "pct start {{ web_vmid }}"
+      when:
+        - not (web_ct_final_vlan | bool)
+        - "'status: stopped' in web_status_before_boot.stdout"
+      changed_when: true
+
+    - name: Attendre le demarrage du CT Web
+      ansible.builtin.command: "pct status {{ web_vmid }}"
+      register: web_status
+      until: "'running' in web_status.stdout"
+      retries: 20
+      delay: 3
+      changed_when: false
+      when: not (web_ct_final_vlan | bool)
+
+    - name: Installer nginx et les outils de test dans le CT Web (delais bornes)
       ansible.builtin.shell: |
+        set -euo pipefail
         pct exec {{ web_vmid }} -- bash -s <<'EOS'
-        [ -f /var/lib/tp3-provisioned ] && exit 0
-        set -e
-        for i in $(seq 1 30); do getent hosts deb.debian.org >/dev/null && break; sleep 2; done
+        set -euo pipefail
+        if [ -f /var/lib/tp3-provisioned ]; then exit 0; fi
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq
-        apt-get install -y -qq nginx curl netcat-openbsd nmap openssh-client iputils-ping mariadb-client
+        for i in $(seq 1 30); do
+          if getent hosts deb.debian.org >/dev/null 2>&1; then break; fi
+          sleep 2
+        done
+        getent hosts deb.debian.org >/dev/null 2>&1 || {
+          echo "DNS indisponible dans le CT Web" >&2
+          exit 20
+        }
+        timeout 300 apt-get update
+        timeout 600 apt-get install -y nginx curl netcat-openbsd nmap openssh-client iputils-ping mariadb-client
         echo "<h1>DMZ web - ct-web-01</h1>" > /var/www/html/index.html
         systemctl enable --now nginx
         touch /var/lib/tp3-provisioned
         EOS
       args:
         executable: /bin/bash
-      changed_when: false
+      register: web_provision
+      changed_when: web_provision.rc == 0
+      when: not (web_ct_final_vlan | bool)
 
-    - name: Basculer le CT web sur vmbr0, VLAN 10, IP 192.168.10.10
+    - name: Basculer le CT Web sur vmbr0 VLAN 10
       ansible.builtin.shell: |
         set -e
-        if pct config {{ web_vmid }} | grep -q '^net0:.*tag=10'; then echo already; exit 0; fi
         pct shutdown {{ web_vmid }} --timeout 30 || pct stop {{ web_vmid }}
-        pct set {{ web_vmid }} --net0 name=eth0,bridge=vmbr0,tag=10,ip={{ web_ip }}/24,gw={{ dmz_gw }},firewall=1
+        pct set {{ web_vmid }} --net0 name=eth0,bridge=vmbr0,tag=10,ip={{ web_ip }}/24,gw={{ dmz_gw }},firewall=0
         pct start {{ web_vmid }}
-        sleep 5
       args:
         executable: /bin/bash
-      register: webmove
-      changed_when: "'already' not in webmove.stdout"
+      when: not (web_ct_final_vlan | bool)
+
+    - name: Attendre que le CT Web soit de nouveau actif
+      ansible.builtin.command: "pct status {{ web_vmid }}"
+      register: web_final_status
+      until: "'running' in web_final_status.stdout"
+      retries: 20
+      delay: 3
+      changed_when: false
 
     # ------------------------------------------------------------------ preuves
     - name: Preuves etape 2 (tags, IP, isolation L2)
       ansible.builtin.shell: |
-        echo "### qm config {{ db_vmid }} | grep net0"; qm config {{ db_vmid }} | grep '^net0'
-        echo "### pct config {{ web_vmid }} | grep net0"; pct config {{ web_vmid }} | grep '^net0'
-        echo; echo "### bridge vlan show (ports des invites)"
+        set -e
+        echo "### qm config {{ db_vmid }}"; qm config {{ db_vmid }} | grep -E '^(name|net0|ipconfig0|agent):'
+        echo; echo "### pct config {{ web_vmid }}"; pct config {{ web_vmid }} | grep -E '^(hostname|net0):'
+        echo; echo "### bridge vlan show"
         bridge vlan show | grep -E 'fwpr{{ db_vmid }}p0|fwpr{{ web_vmid }}p0|tap{{ db_vmid }}i0|veth{{ web_vmid }}i0' || true
-        echo; echo "### IP dans le CT web"; pct exec {{ web_vmid }} -- ip -4 -br a
-        echo; echo "### IP dans la VM DB"; echo 'ip -4 -br a' | /usr/local/sbin/tp3-vmexec {{ db_vmid }}
-        echo; echo "### ping CT web -> VM DB (ECHEC attendu tant que 07 n'a pas ete lance)"
-        pct exec {{ web_vmid }} -- ping -c2 -W1 {{ db_ip }} || echo "ping KO (attendu : VLAN differents, pas de routeur)"
+        echo; echo "### IP dans le CT Web"; pct exec {{ web_vmid }} -- ip -4 -br a
+        echo; echo "### IP VM DB (QEMU Guest Agent)"
+        qm guest cmd {{ db_vmid }} network-get-interfaces
+        echo; echo "### ping CT Web -> VM DB (ECHEC attendu avant l'etape 07)"
+        pct exec {{ web_vmid }} -- ping -c2 -W1 {{ db_ip }} || echo "ping KO (attendu : VLAN differents, routage non configure)"
       args:
         executable: /bin/bash
       register: proof

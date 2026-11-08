@@ -1,0 +1,81 @@
+### qm config 101
+agent: enabled=1
+ipconfig0: ip=192.168.20.10/24,gw=192.168.20.1
+name: vm-db-01
+net0: virtio=BC:24:11:48:83:AC,bridge=vmbr0,firewall=0,tag=20
+
+### pct config 102
+hostname: ct-web-01
+net0: name=eth0,bridge=vmbr0,firewall=0,gw=192.168.10.1,hwaddr=BC:24:11:B7:01:EA,ip=192.168.10.10/24,tag=10,type=veth
+
+### bridge vlan show
+tap101i0          20 PVID Egress Untagged
+veth102i0         10 PVID Egress Untagged
+
+### IP dans le CT Web
+lo               UNKNOWN        127.0.0.1/8 
+eth0@if21        UP             192.168.10.10/24 
+
+### IP VM DB (QEMU Guest Agent)
+[
+   {
+      "hardware-address" : "00:00:00:00:00:00",
+      "ip-addresses" : [
+         {
+            "ip-address" : "127.0.0.1",
+            "ip-address-type" : "ipv4",
+            "prefix" : 8
+         },
+         {
+            "ip-address" : "::1",
+            "ip-address-type" : "ipv6",
+            "prefix" : 128
+         }
+      ],
+      "name" : "lo",
+      "statistics" : {
+         "rx-bytes" : 12326,
+         "rx-dropped" : 0,
+         "rx-errs" : 0,
+         "rx-packets" : 138,
+         "tx-bytes" : 12326,
+         "tx-dropped" : 0,
+         "tx-errs" : 0,
+         "tx-packets" : 138
+      }
+   },
+   {
+      "hardware-address" : "bc:24:11:48:83:ac",
+      "ip-addresses" : [
+         {
+            "ip-address" : "192.168.20.10",
+            "ip-address-type" : "ipv4",
+            "prefix" : 24
+         },
+         {
+            "ip-address" : "fe80::be24:11ff:fe48:83ac",
+            "ip-address-type" : "ipv6",
+            "prefix" : 64
+         }
+      ],
+      "name" : "eth0",
+      "statistics" : {
+         "rx-bytes" : 0,
+         "rx-dropped" : 0,
+         "rx-errs" : 0,
+         "rx-packets" : 0,
+         "tx-bytes" : 5310,
+         "tx-dropped" : 0,
+         "tx-errs" : 0,
+         "tx-packets" : 109
+      }
+   }
+]
+
+### ping CT Web -> VM DB (ECHEC attendu avant l'etape 07)
+PING 192.168.20.10 (192.168.20.10) 56(84) bytes of data.
+
+--- 192.168.20.10 ping statistics ---
+2 packets transmitted, 0 received, 100% packet loss, time 1057ms
+
+ping KO (attendu : VLAN differents, routage non configure)

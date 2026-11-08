@@ -1,88 +1,181 @@
-# Etape 1 : Proxmox VE 8 installe par-dessus Debian 12 (methode officielle "Install on Debian")
-- hosts: pve
+
+---
+# ============================================================
+# TP2 - INSTALLATION PROXMOX VE 8 SUR DEBIAN 12
+#
+# Noeuds :
+#   pve01 : 192.168.56.11
+#   pve02 : 192.168.56.12
+#
+# Reseau :
+#   vmbr0 : gestion + Corosync
+#   vmbr1 : reseau des machines virtuelles
+#
+# Execution :
+#   ansible-playbook -i inventory.ini \
+#     -e @secrets.yml 01-install-proxmox.yml
+#
+# Reseau uniquement :
+#   ansible-playbook -i inventory.ini \
+#     -e @secrets.yml 01-install-proxmox.yml --tags network
+#
+# ============================================================
+
+- name: Installation Proxmox VE 8
+  hosts: pve
   become: true
+  gather_facts: true
+
+  vars:
+    proxmox_repo: "deb [arch=amd64] http://download.proxmox.com/debian/pve bookworm pve-no-subscription"
+    proxmox_key_url: "https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg"
+
+  pre_tasks:
+
+    - name: Verifier les variables obligatoires
+      ansible.builtin.assert:
+        that:
+          - node_ip is defined
+          - guest_net is defined
+          - domain is defined
+          - pve_root_password is defined
+          - ansible_host is defined
+        fail_msg: "Une variable obligatoire est absente de l'inventory ou de secrets.yml"
+
+    - name: Verifier que l'adresse IP de gestion correspond a l'hote
+      ansible.builtin.assert:
+        that:
+          - node_ip == ansible_host
+        fail_msg: "node_ip doit correspondre a ansible_host pour conserver la connexion SSH."
+
   tasks:
-    - name: Nom d'hote
+
+    # ========================================================
+    # 01 - IDENTITE DU NOEUD
+    # ========================================================
+
+    - name: Configurer le hostname
       ansible.builtin.hostname:
         name: "{{ inventory_hostname }}"
 
-    - name: Retirer l'entree 127.0.1.1 (le FQDN doit pointer vers l'IP du noeud)
+    - name: Supprimer l'ancienne entree 127.0.1.1
       ansible.builtin.lineinfile:
         path: /etc/hosts
-        regexp: '^127\.0\.1\.1'
+        regexp: '^127\.0\.1\.1\s'
         state: absent
+        backup: true
 
-    - name: FQDN -> IP du noeud
+    - name: Configurer le FQDN du noeud
       ansible.builtin.lineinfile:
         path: /etc/hosts
-        regexp: '^{{ node_ip }}\s'
+        regexp: '^{{ node_ip | regex_escape }}\s'
         line: "{{ node_ip }} {{ inventory_hostname }}.{{ domain }} {{ inventory_hostname }}"
+        state: present
+        backup: true
 
-    - name: Cle du depot Proxmox
+    # ========================================================
+    # 02 - DEPOT PROXMOX
+    # ========================================================
+
+    - name: Installer les dependances APT
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - wget
+          - gnupg
+        state: present
+        update_cache: true
+        lock_timeout: 300
+
+    - name: Installer la cle officielle Proxmox
       ansible.builtin.get_url:
-        url: https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg
+        url: "{{ proxmox_key_url }}"
         dest: /etc/apt/trusted.gpg.d/proxmox-release-bookworm.gpg
+        owner: root
+        group: root
         mode: "0644"
 
-    - name: Depot no-subscription (pas de depot enterprise)
+    - name: Configurer le depot Proxmox no-subscription
       ansible.builtin.copy:
         dest: /etc/apt/sources.list.d/pve-install-repo.list
-        content: "deb [arch=amd64] http://download.proxmox.com/debian/pve bookworm pve-no-subscription\n"
+        content: "{{ proxmox_repo }}\n"
+        owner: root
+        group: root
+        mode: "0644"
 
-    - name: Forcer IPv4 pour apt (NAT VMware)
+    - name: Forcer IPv4 pour APT
       ansible.builtin.copy:
         dest: /etc/apt/apt.conf.d/99ipv4
         content: 'Acquire::ForceIPv4 "true";'
+        owner: root
+        group: root
+        mode: "0644"
 
-    # --- GRUB : sans disque cible enregistre dans debconf, grub-pc echoue en mode non interactif ---
-    - name: Disque systeme (cible de GRUB)
-      ansible.builtin.shell:
-        cmd: |
-          SRC=$(findmnt -no SOURCE / 2>/dev/null | sed 's/\[.*//')
-          DISK=""
-          # remonte de la partition / du volume LVM jusqu au disque physique
-          if [ -b "$SRC" ]; then
-            DISK=$(lsblk -nsro NAME,TYPE "$SRC" 2>/dev/null | awk '$2=="disk" {print $1; exit}')
-          fi
-          # secours : premier disque de la machine
-          if [ -z "$DISK" ]; then
-            DISK=$(lsblk -dnro NAME,TYPE | awk '$2=="disk" {print $1; exit}')
-          fi
-          echo "$DISK"
+    # ========================================================
+    # 03 - PREPARATION GRUB
+    # ========================================================
+
+    - name: Detecter le disque systeme
+      ansible.builtin.shell: |
+        set -e
+
+        SRC=$(findmnt -no SOURCE / | sed 's/\[.*//')
+        DISK=""
+
+        if [ -b "$SRC" ]; then
+          DISK=$(lsblk -s -nro NAME,TYPE "$SRC" |
+            awk '$2 == "disk" {print $1; exit}')
+        fi
+
+        if [ -z "$DISK" ]; then
+          DISK=$(lsblk -dnro NAME,TYPE |
+            awk '$2 == "disk" {print $1; exit}')
+        fi
+
+        [ -n "$DISK" ] || exit 1
+
+        echo "$DISK"
+      args:
         executable: /bin/bash
       register: root_disk
       changed_when: false
-      failed_when: root_disk.stdout | trim == "" or not (root_disk.stdout | trim is match('^[a-zA-Z0-9]+$'))
+      failed_when: root_disk.stdout | trim == ""
 
-    - name: Disque retenu pour GRUB
+    - name: Afficher le disque systeme
       ansible.builtin.debug:
-        msg: "GRUB sera installe sur /dev/{{ root_disk.stdout | trim }}"
+        msg: "GRUB sera configure sur /dev/{{ root_disk.stdout | trim }}"
 
-    - name: Le disque existe bien
-      ansible.builtin.command: test -b /dev/{{ root_disk.stdout | trim }}
+    - name: Verifier le disque systeme
+      ansible.builtin.command:
+        cmd: "test -b /dev/{{ root_disk.stdout | trim }}"
       changed_when: false
 
-    - name: Preseed grub-pc (disque cible)
+    - name: Preconfigurer le disque GRUB
       ansible.builtin.debconf:
         name: grub-pc
         question: grub-pc/install_devices
         vtype: multiselect
         value: "/dev/{{ root_disk.stdout | trim }}"
 
-    - name: Preseed grub-pc (ne pas laisser la liste vide)
+    - name: Preconfigurer grub-pc install_devices_empty
       ansible.builtin.debconf:
         name: grub-pc
         question: grub-pc/install_devices_empty
         vtype: boolean
         value: "false"
 
-    - name: Terminer une installation dpkg interrompue (grub-pc a moitie configure)
-      ansible.builtin.command: dpkg --configure -a
+    - name: Terminer une configuration dpkg interrompue
+      ansible.builtin.command:
+        cmd: dpkg --configure -a
       environment:
         DEBIAN_FRONTEND: noninteractive
       changed_when: false
 
-    - name: Mise a jour complete
+    # ========================================================
+    # 04 - MISE A JOUR DE DEBIAN
+    # ========================================================
+
+    - name: Mise a jour complete du systeme
       ansible.builtin.apt:
         update_cache: true
         upgrade: dist
@@ -93,31 +186,60 @@
       async: 3600
       poll: 15
 
-    - name: Noyau Proxmox
+    # ========================================================
+    # 05 - INSTALLATION DU NOYAU PROXMOX
+    # ========================================================
+
+    - name: Installer le noyau Proxmox
       ansible.builtin.apt:
         name: proxmox-default-kernel
+        state: present
+        lock_timeout: 300
       environment:
         DEBIAN_FRONTEND: noninteractive
-      register: kernel
+      register: kernel_install
 
-    - name: Redemarrage sur le noyau Proxmox
+    - name: Redemarrer sur le noyau Proxmox si necessaire
       ansible.builtin.reboot:
+        msg: "Redemarrage sur le noyau Proxmox"
         reboot_timeout: 600
-      when: kernel is changed
+        connect_timeout: 10
+        post_reboot_delay: 15
+        test_command: uname -r
+      when: kernel_install.changed
 
-    - name: Preseed postfix
+    # ========================================================
+    # 06 - CONFIGURATION POSTFIX
+    # ========================================================
+
+    - name: Preconfigurer Postfix
       ansible.builtin.debconf:
         name: postfix
-        question: "{{ item.q }}"
-        vtype: "{{ item.t }}"
-        value: "{{ item.v }}"
+        question: "{{ item.question }}"
+        vtype: "{{ item.type }}"
+        value: "{{ item.value }}"
       loop:
-        - { q: postfix/main_mailer_type, t: select, v: "Local only" }
-        - { q: postfix/mailname, t: string, v: "{{ inventory_hostname }}.{{ domain }}" }
+        - question: postfix/main_mailer_type
+          type: select
+          value: "Local only"
 
-    - name: Paquets Proxmox VE
+        - question: postfix/mailname
+          type: string
+          value: "{{ inventory_hostname }}.{{ domain }}"
+
+    # ========================================================
+    # 07 - INSTALLATION PROXMOX VE
+    # ========================================================
+
+    - name: Installer les paquets Proxmox VE
       ansible.builtin.apt:
-        name: [proxmox-ve, postfix, open-iscsi, chrony, ifupdown2]
+        name:
+          - proxmox-ve
+          - postfix
+          - open-iscsi
+          - chrony
+          - ifupdown2
+        state: present
         lock_timeout: 300
       environment:
         DEBIAN_FRONTEND: noninteractive
@@ -125,129 +247,396 @@
       async: 3600
       poll: 15
 
-    - name: Retirer le noyau Debian et os-prober
+    # ========================================================
+    # 08 - NETTOYAGE DU NOYAU DEBIAN
+    # ========================================================
+
+    - name: Retirer le noyau Debian generique
       ansible.builtin.apt:
-        name: [linux-image-amd64, "linux-image-6.1*", os-prober]
+        name:
+          - linux-image-amd64
+          - os-prober
         state: absent
+        purge: false
+        autoremove: false
+        lock_timeout: 300
       environment:
         DEBIAN_FRONTEND: noninteractive
 
-    - name: update-grub
-      ansible.builtin.command: update-grub
+    - name: Mettre a jour GRUB
+      ansible.builtin.command:
+        cmd: update-grub
       changed_when: false
 
-    - name: Mot de passe root (connexion root@pam a la web-UI)
+    # ========================================================
+    # 09 - MOT DE PASSE ROOT PROXMOX
+    # ========================================================
+
+    - name: Configurer le mot de passe root
       ansible.builtin.user:
         name: root
         password: "{{ pve_root_password | password_hash('sha512') }}"
+        update_password: always
       no_log: true
 
-    # ------------------------------------------------------------------
-    # Reseau : vmbr0 (gestion) + vmbr1 (invites NAT)
-    # Applique en direct avec ifreload (pas de reboot), puis verifie.
-    # Rejouable seul : ansible-playbook -e @secrets.yml 01-install-proxmox.yml --tags network
-    # Une fois vmbr0 et vmbr1 presents, rien n'est reecrit (le 05 VLAN-aware n'est pas ecrase).
-    # ------------------------------------------------------------------
-    - name: Reseau vmbr0 / vmbr1
-      tags: [network]
-      block:
-        - name: vmbr0 et vmbr1 sont-ils deja montes ?
-          ansible.builtin.shell: ip link show vmbr0 >/dev/null 2>&1 && ip link show vmbr1 >/dev/null 2>&1
-          register: bridges
-          changed_when: false
-          failed_when: false
+    # ========================================================
+    # 10 - CONFIGURATION RESEAU PROXMOX
+    #
+    # vmbr0 : gestion / Corosync
+    # vmbr1 : reseau des machines virtuelles
+    #
+    # Cette section est independante et rejouable.
+    # ========================================================
 
-        - name: Carte physique de gestion (celle qui porte node_ip, ou le port du bridge qui la porte)
+    - name: Configuration reseau Proxmox
+      tags:
+        - network
+
+      block:
+
+        # ----------------------------------------------------
+        # DETECTION DES INTERFACES
+        # ----------------------------------------------------
+
+        - name: Detecter les interfaces physiques
           ansible.builtin.shell: |
-            IF=$(ip -4 -o addr show | awk -v ip="{{ node_ip }}/" 'index($4, ip)==1 {print $2; exit}')
-            [ -n "$IF" ] || exit 1
-            if [ -d "/sys/class/net/$IF/brif" ]; then
-              ls "/sys/class/net/$IF/brif" | grep -Ev '^(tap|veth|fwpr|fwln)' | head -n1
-            else
-              echo "$IF"
+            set -e
+
+            # Interface portant l'adresse de gestion
+            MGMT=$(ip -4 -o addr show |
+              awk -v ip="{{ node_ip }}" '
+                {
+                  split($4, a, "/")
+                  if (a[1] == ip) {
+                    print $2
+                    exit
+                  }
+                }')
+
+            if [ -z "$MGMT" ]; then
+              echo "IP de gestion introuvable : {{ node_ip }}" >&2
+              exit 1
             fi
+
+            # Si l'adresse est deja sur vmbr0,
+            # retrouver le port physique du bridge.
+            if [ -d "/sys/class/net/$MGMT/brif" ]; then
+
+              PORTS=$(find "/sys/class/net/$MGMT/brif" \
+                -mindepth 1 -maxdepth 1 -printf '%f\n')
+
+              COUNT=$(printf '%s\n' "$PORTS" |
+                grep -c . || true)
+
+              if [ "$COUNT" -ne 1 ]; then
+                echo "vmbr0 doit avoir exactement un port physique" >&2
+                exit 1
+              fi
+
+              MGMT=$(printf '%s\n' "$PORTS" | head -n1)
+            fi
+
+            # Interface de la route par defaut
+            NAT=$(ip -4 route show default |
+              awk '
+                NR == 1 {
+                  for (i=1; i<=NF; i++) {
+                    if ($i == "dev") {
+                      print $(i+1)
+                      exit
+                    }
+                  }
+                }')
+
+            if [ -z "$NAT" ]; then
+              echo "Interface NAT introuvable" >&2
+              exit 1
+            fi
+
+            # Si la route passe par un bridge,
+            # retrouver son interface physique.
+            if [ -d "/sys/class/net/$NAT/brif" ]; then
+
+              PORTS=$(find "/sys/class/net/$NAT/brif" \
+                -mindepth 1 -maxdepth 1 -printf '%f\n')
+
+              COUNT=$(printf '%s\n' "$PORTS" |
+                grep -c . || true)
+
+              if [ "$COUNT" -ne 1 ]; then
+                echo "Impossible de retrouver le port NAT" >&2
+                exit 1
+              fi
+
+              NAT=$(printf '%s\n' "$PORTS" | head -n1)
+            fi
+
+            if [ "$MGMT" = "$NAT" ]; then
+              echo "ERREUR : NAT et gestion utilisent la meme interface" >&2
+              exit 1
+            fi
+
+            test -e "/sys/class/net/$MGMT"
+            test -e "/sys/class/net/$NAT"
+
+            echo "$MGMT"
+            echo "$NAT"
+
           args:
             executable: /bin/bash
-          register: mgmt_detect
+
+          register: detected_interfaces
           changed_when: false
-          failed_when: mgmt_detect.stdout | trim == ""
-          when: bridges.rc != 0
 
-        - name: Interface NAT et interface de gestion
+        - name: Enregistrer les interfaces reseau
           ansible.builtin.set_fact:
-            nat_if: "{{ ansible_default_ipv4.interface }}"
-            mgmt_if: "{{ mgmt_detect.stdout | trim }}"
-          when: bridges.rc != 0
+            mgmt_if: "{{ detected_interfaces.stdout_lines[0] }}"
+            nat_if: "{{ detected_interfaces.stdout_lines[1] }}"
 
-        - name: Ecrire /etc/network/interfaces
+        - name: Afficher les interfaces detectees
+          ansible.builtin.debug:
+            msg:
+              - "Interface gestion : {{ mgmt_if }}"
+              - "Interface NAT : {{ nat_if }}"
+              - "IP gestion : {{ node_ip }}"
+              - "Reseau invites : {{ guest_net }}.0/24"
+
+        # ----------------------------------------------------
+        # SAUVEGARDE DE LA CONFIGURATION
+        # ----------------------------------------------------
+
+        - name: Creer le dossier de sauvegarde reseau
+          ansible.builtin.file:
+            path: /root/network-backups
+            state: directory
+            owner: root
+            group: root
+            mode: "0700"
+
+        # ----------------------------------------------------
+        # FORWARDING IPV4
+        # ----------------------------------------------------
+
+        - name: Persister le forwarding IPv4
+          ansible.builtin.copy:
+            dest: /etc/sysctl.d/99-proxmox-forwarding.conf
+            content: |
+              net.ipv4.ip_forward=1
+            owner: root
+            group: root
+            mode: "0644"
+          register: forwarding_config
+
+        - name: Appliquer le forwarding IPv4
+          ansible.builtin.command:
+            cmd: sysctl --system
+          when: forwarding_config.changed
+          changed_when: true
+
+        # ----------------------------------------------------
+        # GENERATION DU FICHIER RESEAU
+        # ----------------------------------------------------
+
+        - name: Generer la configuration reseau
           ansible.builtin.template:
             src: interfaces.j2
             dest: /etc/network/interfaces
+            owner: root
+            group: root
+            mode: "0644"
             backup: true
-          when: bridges.rc != 0
+          register: network_config
 
-        # L'IP de gestion passe de la carte physique au bridge : la connexion SSH
-        # coupe quelques secondes. On lance donc ifreload en tache detachee.
-        - name: Appliquer le reseau (ifreload detache)
-          ansible.builtin.shell: sleep 2; ifreload -a > /root/ifreload.log 2>&1
+        # ----------------------------------------------------
+        # VERIFICATION DE LA CONFIGURATION EXISTANTE
+        # ----------------------------------------------------
+
+        - name: Verifier la configuration reseau active
+          ansible.builtin.shell: |
+            set -e
+
+            # Bridges presents
+            ip link show vmbr0 >/dev/null
+            ip link show vmbr1 >/dev/null
+
+            # IP de gestion
+            ip -4 -o addr show dev vmbr0 |
+              grep -qF " {{ node_ip }}/"
+
+            # Port physique de vmbr0
+            test -L "/sys/class/net/{{ mgmt_if }}/master"
+
+            test "$(basename "$(readlink -f /sys/class/net/{{ mgmt_if }}/master)")" = "vmbr0"
+
+            # Adresse de vmbr1
+            ip -4 -o addr show dev vmbr1 |
+              grep -qF " {{ guest_net }}.1/"
+
+            # vmbr1 doit etre sans port physique
+            test -d /sys/class/net/vmbr1/brif
+
+            test -z "$(ls -A /sys/class/net/vmbr1/brif)"
+
+            # Route par defaut conservee via NAT
+            ip -4 route show default |
+              grep -q "dev {{ nat_if }}"
+
+          args:
+            executable: /bin/bash
+
+          register: network_state
+          changed_when: false
+          failed_when: false
+
+        # ----------------------------------------------------
+        # APPLICATION DU RESEAU
+        # ----------------------------------------------------
+
+        - name: Sauvegarder la configuration avant application
+          ansible.builtin.copy:
+            src: /etc/network/interfaces
+            dest: /root/network-backups/interfaces-before-apply
+            remote_src: true
+            owner: root
+            group: root
+            mode: "0600"
+          when: network_config.changed or network_state.rc != 0
+
+        - name: Verifier la syntaxe de la configuration
+          ansible.builtin.command:
+            cmd: ifquery --list
+          changed_when: false
+          when: network_config.changed or network_state.rc != 0
+
+        - name: Appliquer le reseau avec ifreload
+          ansible.builtin.shell: |
+            sleep 3
+            ifreload -a > /root/ifreload.log 2>&1
           args:
             executable: /bin/bash
           async: 120
           poll: 0
-          when: bridges.rc != 0
+          when: network_config.changed or network_state.rc != 0
 
-        - name: Fermer la connexion SSH devenue obsolete
+        - name: Reinitialiser la connexion SSH
           ansible.builtin.meta: reset_connection
-          when: bridges.rc != 0
+          when: network_config.changed or network_state.rc != 0
 
-        - name: Attendre que le noeud reponde sur sa nouvelle interface
+        - name: Attendre le retour de la connexion SSH
           ansible.builtin.wait_for_connection:
             delay: 5
             timeout: 180
-          when: bridges.rc != 0
+            sleep: 5
+          when: network_config.changed or network_state.rc != 0
 
-        - name: Verifier que vmbr0 et vmbr1 existent et sont montes
-          ansible.builtin.shell: ip -br link show {{ item }} | grep -qE 'UP|UNKNOWN'
-          loop: [vmbr0, vmbr1]
-          register: bridge_check
-          until: bridge_check.rc == 0
-          retries: 10
-          delay: 3
+        # ----------------------------------------------------
+        # VALIDATION FINALE
+        # ----------------------------------------------------
+
+        - name: Verifier la presence des deux bridges
+          ansible.builtin.command:
+            cmd: "ip link show {{ item }}"
+          loop:
+            - vmbr0
+            - vmbr1
           changed_when: false
 
-        - name: La config est bien persistee dans le fichier
-          ansible.builtin.command: grep -qE '^iface vmbr0' /etc/network/interfaces
-          changed_when: false
-
-        - name: vmbr0 porte bien l'IP du noeud
-          ansible.builtin.shell: ip -4 -o addr show dev vmbr0 | grep -qF " {{ node_ip }}/"
-          changed_when: false
-
-      rescue:
-        - name: Etat reseau au moment de l'echec
+        - name: Verifier l'adresse de gestion
           ansible.builtin.shell: |
-            echo "### interfaces"; cat /etc/network/interfaces
-            echo; echo "### ls /etc/network"; ls -la /etc/network/
-            echo; echo "### ip -br a"; ip -br a
-            echo; echo "### ifreload.log"; cat /root/ifreload.log 2>/dev/null
+            ip -4 -o addr show dev vmbr0 |
+            grep -qF " {{ node_ip }}/"
+          changed_when: false
+
+        - name: Verifier le port physique de vmbr0
+          ansible.builtin.shell: |
+            test "$(basename "$(readlink -f /sys/class/net/{{ mgmt_if }}/master)")" = "vmbr0"
+          changed_when: false
+
+        - name: Verifier l'adresse du reseau invites
+          ansible.builtin.shell: |
+            ip -4 -o addr show dev vmbr1 |
+            grep -qF " {{ guest_net }}.1/"
+          changed_when: false
+
+        - name: Verifier la route Internet
+          ansible.builtin.command:
+            cmd: ip -4 route show default
+          register: default_route
+          changed_when: false
+          failed_when: "('dev ' ~ nat_if) not in default_route.stdout"
+
+        - name: Verifier la configuration persistante
+          ansible.builtin.shell: |
+            set -e
+
+            grep -qF "bridge-ports {{ mgmt_if }}" /etc/network/interfaces
+            grep -qF "address {{ node_ip }}/24" /etc/network/interfaces
+            grep -qF "bridge-ports none" /etc/network/interfaces
+            grep -qF "address {{ guest_net }}.1/24" /etc/network/interfaces
+
           args:
             executable: /bin/bash
-          register: net_dump
+          changed_when: false
+
+        # ----------------------------------------------------
+        # DIAGNOSTIC EN CAS D'ERREUR
+        # ----------------------------------------------------
+
+      rescue:
+
+        - name: Collecter les informations reseau
+          ansible.builtin.shell: |
+            echo "========== INTERFACES =========="
+            ip -br addr
+
+            echo "========== ROUTES =========="
+            ip route
+
+            echo "========== BRIDGES =========="
+            bridge link
+
+            echo "========== CONFIGURATION =========="
+            cat /etc/network/interfaces
+
+            echo "========== IFRELOAD =========="
+            cat /root/ifreload.log 2>/dev/null || true
+
+          args:
+            executable: /bin/bash
+
+          register: network_diagnostic
           changed_when: false
           failed_when: false
 
         - name: Afficher le diagnostic
           ansible.builtin.debug:
-            var: net_dump.stdout_lines
+            var: network_diagnostic.stdout_lines
 
-        - name: Echec du reseau
+        - name: Signaler une erreur reseau
           ansible.builtin.fail:
-            msg: "vmbr0/vmbr1 ne sont pas montes. Voir le diagnostic ci-dessus, et utiliser la console VMware si SSH est coupe."
+            msg: >-
+              La configuration reseau Proxmox a echoue.
+              Consulter le diagnostic et utiliser la console VMware
+              si la connexion SSH est interrompue.
 
-    - name: Web-UI joignable sur 8006
+    # ========================================================
+    # 11 - VERIFICATION WEB UI PROXMOX
+    # ========================================================
+
+    - name: Attendre que le service Web Proxmox reponde
       ansible.builtin.wait_for:
         host: "{{ ansible_host }}"
         port: 8006
-        timeout: 120
+        state: started
+        timeout: 180
+        sleep: 5
       delegate_to: localhost
       become: false
+
+    - name: Afficher le resultat de l'installation
+      ansible.builtin.debug:
+        msg:
+          - "Installation Proxmox terminee sur {{ inventory_hostname }}"
+          - "Web UI : https://{{ node_ip }}:8006"
+          - "Gestion : vmbr0 / {{ node_ip }}"
+          - "Reseau invites : vmbr1 / {{ guest_net }}.1"

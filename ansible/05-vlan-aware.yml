@@ -48,6 +48,25 @@
         net_rollback_script: "cp /etc/network/interfaces.pre-tp3 /etc/network/interfaces"
       when: net is changed
 
+    - name: Garantir une unique regle NAT apres chaque execution (idempotent)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        RULE="-s {{ guest_net }}.0/24 -o {{ nat_if }} -j MASQUERADE"
+        COUNT=$(iptables -t nat -S POSTROUTING | grep -F -- "$RULE" | wc -l)
+        while [ "$COUNT" -gt 1 ]; do
+          iptables -t nat -D POSTROUTING $RULE
+          COUNT=$((COUNT - 1))
+          echo CHANGED
+        done
+        if [ "$COUNT" -eq 0 ]; then
+          iptables -t nat -A POSTROUTING $RULE
+          echo CHANGED
+        fi
+      args:
+        executable: /bin/bash
+      register: nat_rule
+      changed_when: "'CHANGED' in nat_rule.stdout"
+
     - name: Verification - bridge vlan show / vlan_filtering / vmbr0.99
       ansible.builtin.shell: |
         echo "### /etc/network/interfaces"; cat /etc/network/interfaces

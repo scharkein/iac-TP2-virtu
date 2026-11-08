@@ -20,5 +20,6 @@ iface vmbr1 inet static
     bridge-stp off
     bridge-fd 0
     post-up   echo 1 > /proc/sys/net/ipv4/ip_forward
-    post-up   iptables -t nat -A POSTROUTING -s {{ guest_net }}.0/24 -o {{ nat_if }} -j MASQUERADE
-    post-down iptables -t nat -D POSTROUTING -s {{ guest_net }}.0/24 -o {{ nat_if }} -j MASQUERADE
+    # Etat idempotent : supprimer les doublons eventuels, puis garantir une seule regle.
+    post-up   while iptables -t nat -C POSTROUTING -s {{ guest_net }}.0/24 -o {{ nat_if }} -j MASQUERADE 2>/dev/null; do iptables -t nat -D POSTROUTING -s {{ guest_net }}.0/24 -o {{ nat_if }} -j MASQUERADE; done; iptables -t nat -A POSTROUTING -s {{ guest_net }}.0/24 -o {{ nat_if }} -j MASQUERADE
+    post-down while iptables -t nat -C POSTROUTING -s {{ guest_net }}.0/24 -o {{ nat_if }} -j MASQUERADE 2>/dev/null; do iptables -t nat -D POSTROUTING -s {{ guest_net }}.0/24 -o {{ nat_if }} -j MASQUERADE; done
