@@ -1,4 +1,3 @@
-
 ---
 # ============================================================
 # TP2 - INSTALLATION PROXMOX VE 8 SUR DEBIAN 12
@@ -19,6 +18,9 @@
 #   ansible-playbook -i inventory.ini \
 #     -e @secrets.yml 01-install-proxmox.yml --tags network
 #
+# Rejouable : si Proxmox VE est deja installe, les etapes lourdes
+# (mise a jour, noyau, proxmox-ve) sont sautees. La section reseau est
+# sautee si le TP3 (05-vlan-aware.yml) est deja applique.
 # ============================================================
 
 - name: Installation Proxmox VE 8
@@ -29,6 +31,7 @@
   vars:
     proxmox_repo: "deb [arch=amd64] http://download.proxmox.com/debian/pve bookworm pve-no-subscription"
     proxmox_key_url: "https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg"
+    dns_servers: ["1.1.1.1", "9.9.9.9"]
 
   pre_tasks:
 
@@ -49,6 +52,74 @@
         fail_msg: "node_ip doit correspondre a ansible_host pour conserver la connexion SSH."
 
   tasks:
+
+    # ========================================================
+    # 00 - DNS ET DEPOTS DEBIAN
+    #
+    # Le relais DNS de VMware NAT (donne par DHCP) lache pendant les gros
+    # telechargements apt ("Temporary failure resolving ..."). On impose des
+    # resolveurs publics, de facon persistante (dhclient + resolv.conf).
+    # ========================================================
+
+    - name: DNS - dhclient ne doit pas ecraser les resolveurs publics
+      ansible.builtin.lineinfile:
+        path: /etc/dhcp/dhclient.conf
+        regexp: '^\s*supersede\s+domain-name-servers'
+        line: "supersede domain-name-servers {{ dns_servers | join(', ') }};"
+        create: true
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: DNS - etat de /etc/resolv.conf
+      ansible.builtin.stat:
+        path: /etc/resolv.conf
+      register: resolv_stat
+
+    - name: DNS - ecrire /etc/resolv.conf (sauf s'il est gere par systemd-resolved)
+      ansible.builtin.copy:
+        dest: /etc/resolv.conf
+        content: |
+          {% for s in dns_servers %}
+          nameserver {{ s }}
+          {% endfor %}
+          options timeout:2 attempts:3
+        owner: root
+        group: root
+        mode: "0644"
+      when: not (resolv_stat.stat.islnk | default(false)) or ('systemd' not in (resolv_stat.stat.lnk_source | default('')))
+
+    - name: DNS - attendre une resolution fonctionnelle
+      ansible.builtin.command:
+        cmd: getent hosts deb.debian.org
+      register: dns_check
+      until: dns_check.rc == 0
+      retries: 12
+      delay: 5
+      changed_when: false
+
+    - name: Depots Debian - remplacer l'alias deprecie httpredir par deb.debian.org
+      ansible.builtin.shell: |
+        FILES=$(grep -rl 'httpredir\.debian\.org' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null || true)
+        [ -n "$FILES" ] || exit 0
+        echo "$FILES" | xargs sed -i 's/httpredir\.debian\.org/deb.debian.org/g'
+        echo CHANGED
+      args:
+        executable: /bin/bash
+      register: httpredir_fix
+      changed_when: "'CHANGED' in httpredir_fix.stdout"
+
+    - name: APT - IPv4 force, nouvelles tentatives et delais plus longs
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/99ipv4
+        content: |
+          Acquire::ForceIPv4 "true";
+          Acquire::Retries "5";
+          Acquire::http::Timeout "30";
+          Acquire::https::Timeout "30";
+        owner: root
+        group: root
+        mode: "0644"
 
     # ========================================================
     # 01 - IDENTITE DU NOEUD
@@ -86,6 +157,10 @@
         state: present
         update_cache: true
         lock_timeout: 300
+      register: apt_deps
+      until: apt_deps is succeeded
+      retries: 3
+      delay: 15
 
     - name: Installer la cle officielle Proxmox
       ansible.builtin.get_url:
@@ -94,19 +169,15 @@
         owner: root
         group: root
         mode: "0644"
+      register: pve_key
+      until: pve_key is succeeded
+      retries: 3
+      delay: 10
 
     - name: Configurer le depot Proxmox no-subscription
       ansible.builtin.copy:
         dest: /etc/apt/sources.list.d/pve-install-repo.list
         content: "{{ proxmox_repo }}\n"
-        owner: root
-        group: root
-        mode: "0644"
-
-    - name: Forcer IPv4 pour APT
-      ansible.builtin.copy:
-        dest: /etc/apt/apt.conf.d/99ipv4
-        content: 'Acquire::ForceIPv4 "true";'
         owner: root
         group: root
         mode: "0644"
@@ -172,110 +243,148 @@
       changed_when: false
 
     # ========================================================
-    # 04 - MISE A JOUR DE DEBIAN
+    # 04 a 08 - INSTALLATION (sautee si Proxmox VE est deja installe)
     # ========================================================
 
-    - name: Mise a jour complete du systeme
-      ansible.builtin.apt:
-        update_cache: true
-        upgrade: dist
-        lock_timeout: 300
-      environment:
-        DEBIAN_FRONTEND: noninteractive
-        APT_LISTCHANGES_FRONTEND: none
-      async: 3600
-      poll: 15
-
-    # ========================================================
-    # 05 - INSTALLATION DU NOYAU PROXMOX
-    # ========================================================
-
-    - name: Installer le noyau Proxmox
-      ansible.builtin.apt:
-        name: proxmox-default-kernel
-        state: present
-        lock_timeout: 300
-      environment:
-        DEBIAN_FRONTEND: noninteractive
-      register: kernel_install
-
-    - name: Redemarrer sur le noyau Proxmox si necessaire
-      ansible.builtin.reboot:
-        msg: "Redemarrage sur le noyau Proxmox"
-        reboot_timeout: 600
-        connect_timeout: 10
-        post_reboot_delay: 15
-        test_command: uname -r
-      when: kernel_install.changed
-
-    # ========================================================
-    # 06 - CONFIGURATION POSTFIX
-    # ========================================================
-
-    - name: Preconfigurer Postfix
-      ansible.builtin.debconf:
-        name: postfix
-        question: "{{ item.question }}"
-        vtype: "{{ item.type }}"
-        value: "{{ item.value }}"
-      loop:
-        - question: postfix/main_mailer_type
-          type: select
-          value: "Local only"
-
-        - question: postfix/mailname
-          type: string
-          value: "{{ inventory_hostname }}.{{ domain }}"
-
-    # ========================================================
-    # 07 - INSTALLATION PROXMOX VE
-    # ========================================================
-
-    - name: Installer les paquets Proxmox VE
-      ansible.builtin.apt:
-        name:
-          - proxmox-ve
-          - postfix
-          - open-iscsi
-          - chrony
-          - ifupdown2
-        state: present
-        lock_timeout: 300
-      environment:
-        DEBIAN_FRONTEND: noninteractive
-        APT_LISTCHANGES_FRONTEND: none
-      async: 3600
-      poll: 15
-
-    # ========================================================
-    # 08 - NETTOYAGE DU NOYAU DEBIAN
-    # ========================================================
-
-    - name: Retirer le noyau Debian generique
-      ansible.builtin.apt:
-        name:
-          - linux-image-amd64
-          - os-prober
-        state: absent
-        purge: false
-        autoremove: false
-        lock_timeout: 300
-      environment:
-        DEBIAN_FRONTEND: noninteractive
-
-    - name: Mettre a jour GRUB
-      ansible.builtin.command:
-        cmd: update-grub
+    - name: Proxmox VE deja installe ?
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Status}' proxmox-ve 2>/dev/null | grep -q 'install ok installed'
+      args:
+        executable: /bin/bash
+      register: pve_installed
+      failed_when: false
       changed_when: false
+
+    - name: Installation de Proxmox VE (mise a jour, noyau, paquets)
+      when: pve_installed.rc != 0
+      block:
+
+        # ----- 04 - MISE A JOUR DE DEBIAN -----
+
+        - name: Mise a jour complete du systeme
+          ansible.builtin.apt:
+            update_cache: true
+            upgrade: dist
+            lock_timeout: 300
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+            APT_LISTCHANGES_FRONTEND: none
+          async: 3600
+          poll: 15
+          register: apt_upgrade
+          until: apt_upgrade is succeeded
+          retries: 3
+          delay: 20
+
+        # ----- 05 - NOYAU PROXMOX -----
+
+        - name: Installer le noyau Proxmox
+          ansible.builtin.apt:
+            name: proxmox-default-kernel
+            state: present
+            update_cache: true
+            lock_timeout: 300
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+          register: kernel_install
+          until: kernel_install is succeeded
+          retries: 3
+          delay: 20
+
+        # On teste le noyau REELLEMENT actif (et non "kernel_install.changed") :
+        # si un run precedent a installe le noyau puis plante avant le reboot,
+        # on redemarre quand meme.
+        - name: Noyau actuellement demarre
+          ansible.builtin.command:
+            cmd: uname -r
+          register: running_kernel
+          changed_when: false
+
+        - name: Redemarrer sur le noyau Proxmox si necessaire
+          ansible.builtin.reboot:
+            msg: "Redemarrage sur le noyau Proxmox"
+            reboot_timeout: 600
+            connect_timeout: 10
+            post_reboot_delay: 15
+            test_command: uname -r
+          when: "'-pve' not in running_kernel.stdout"
+
+        - name: Verifier que le noyau Proxmox est actif
+          ansible.builtin.command:
+            cmd: uname -r
+          register: kernel_after
+          changed_when: false
+          failed_when: "'-pve' not in kernel_after.stdout"
+
+        # ----- 06 - POSTFIX -----
+
+        - name: Preconfigurer Postfix
+          ansible.builtin.debconf:
+            name: postfix
+            question: "{{ item.question }}"
+            vtype: "{{ item.type }}"
+            value: "{{ item.value }}"
+          loop:
+            - question: postfix/main_mailer_type
+              type: select
+              value: "Local only"
+
+            - question: postfix/mailname
+              type: string
+              value: "{{ inventory_hostname }}.{{ domain }}"
+
+        # ----- 07 - PAQUETS PROXMOX VE -----
+
+        - name: Installer les paquets Proxmox VE
+          ansible.builtin.apt:
+            name:
+              - proxmox-ve
+              - postfix
+              - open-iscsi
+              - chrony
+              - ifupdown2
+            state: present
+            lock_timeout: 300
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+            APT_LISTCHANGES_FRONTEND: none
+          async: 3600
+          poll: 15
+          register: pve_install
+          until: pve_install is succeeded
+          retries: 3
+          delay: 30
+
+        # ----- 08 - NETTOYAGE DU NOYAU DEBIAN -----
+
+        - name: Retirer le noyau Debian generique
+          ansible.builtin.apt:
+            name:
+              - linux-image-amd64
+              - os-prober
+            state: absent
+            purge: false
+            autoremove: false
+            lock_timeout: 300
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+
+        - name: Mettre a jour GRUB
+          ansible.builtin.command:
+            cmd: update-grub
+          changed_when: false
 
     # ========================================================
     # 09 - MOT DE PASSE ROOT PROXMOX
+    #
+    # Sel fixe (derive du nom du noeud) : sinon password_hash genere un
+    # sel aleatoire et la tache est "changed" a chaque execution.
     # ========================================================
 
     - name: Configurer le mot de passe root
       ansible.builtin.user:
         name: root
-        password: "{{ pve_root_password | password_hash('sha512') }}"
+        password: "{{ pve_root_password | password_hash('sha512', (inventory_hostname | hash('sha256'))[:16]) }}"
         update_password: always
       no_log: true
 
@@ -285,12 +394,23 @@
     # vmbr0 : gestion / Corosync
     # vmbr1 : reseau des machines virtuelles
     #
-    # Cette section est independante et rejouable.
+    # Cette section est rejouable. Elle est sautee si le TP3
+    # (05-vlan-aware.yml) est deja applique : sinon elle remplacerait le
+    # fichier VLAN-aware par la version TP2 (sans VLAN ni vmbr0.99).
     # ========================================================
+
+    - name: Le reseau TP3 (VLAN-aware) est-il deja applique ?
+      ansible.builtin.stat:
+        path: /etc/network/interfaces.pre-tp3
+      register: tp3_net
+      tags:
+        - network
+        - always
 
     - name: Configuration reseau Proxmox
       tags:
         - network
+      when: not tp3_net.stat.exists
 
       block:
 
@@ -436,6 +556,14 @@
         # ----------------------------------------------------
         # GENERATION DU FICHIER RESEAU
         # ----------------------------------------------------
+
+        # L'IP statique d'eth1 posee par le Vagrantfile ferait double emploi
+        # avec le bridge vmbr0 (qui porte deja cette IP) : on la retire.
+        - name: Retirer l'eth1 statique du Vagrantfile (vmbr0 prend le relais)
+          ansible.builtin.file:
+            path: /etc/network/interfaces.d/00-vagrant-mgmt
+            state: absent
+          register: vagrant_eth1_removed
 
         - name: Generer la configuration reseau
           ansible.builtin.template:

@@ -24,6 +24,15 @@
         mgmt_if: "{{ brif.stdout }}"
         mgmt_vlan_ip: "{{ mgmt_vlan_ips[inventory_hostname] }}"
 
+    # Un brouillon /etc/network/interfaces.new (cree quand on valide une boite
+    # d'edition du reseau dans l'interface web) fait afficher "Pending changes"
+    # et ecraserait le fichier au prochain "Apply Configuration". On le supprime :
+    # la source de verite est /etc/network/interfaces, genere par Ansible.
+    - name: Supprimer un brouillon interfaces.new obsolete (bandeau "Pending changes")
+      ansible.builtin.file:
+        path: /etc/network/interfaces.new
+        state: absent
+
     - name: Sauvegarde de /etc/network/interfaces (une seule fois)
       ansible.builtin.copy:
         src: /etc/network/interfaces
@@ -42,11 +51,27 @@
         dest: /etc/network/interfaces
       register: net
 
+    # Etat ACTIF du reseau (et pas seulement le fichier) : si un run precedent a ecrit
+    # le fichier sans l'appliquer, ou si le reseau a ete recharge a moitie, on applique.
+    - name: Etat reseau actif conforme au fichier ? (VLAN-aware, VID, vmbr0.99)
+      ansible.builtin.shell: |
+        set -e
+        ip -d link show vmbr0 | grep -q 'vlan_filtering 1'
+        for v in {{ vlan_ids | join(' ') }}; do
+          bridge vlan show dev {{ mgmt_if }} | grep -qw "$v"
+        done
+        ip -4 -o addr show dev vmbr0.99 | grep -qF " {{ mgmt_vlan_ip }}/"
+      args:
+        executable: /bin/bash
+      register: net_state
+      failed_when: false
+      changed_when: false
+
     - name: Appliquer le reseau (avec retour arriere automatique)
       ansible.builtin.include_tasks: tasks/network-apply.yml
       vars:
         net_rollback_script: "cp /etc/network/interfaces.pre-tp3 /etc/network/interfaces"
-      when: net is changed
+      when: net is changed or net_state.rc != 0
 
     - name: Garantir une unique regle NAT apres chaque execution (idempotent)
       ansible.builtin.shell: |
