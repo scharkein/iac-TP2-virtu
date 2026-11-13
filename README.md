@@ -17,6 +17,11 @@ ansible-playbook -e @secrets.yml 02-config-cluster.yml    # etape 2 + BONUS clus
 ansible-playbook -e @secrets.yml 03-guests-backup.yml     # etape 3 + tache de sauvegarde (etape 5)
 # --> faire la MFA a la main (ci-dessous), puis :
 ansible-playbook -e @secrets.yml 04-hardening.yml         # etape 4C : pare-feu 3 niveaux
+ansible-playbook -e @secrets.yml 05-vlan-aware.yml
+ansible-playbook -e @secrets.yml 06-workloads.yml
+ansible-playbook -e @secrets.yml 07-firewall.yml
+ansible-playbook -e @secrets.yml 08-antispoof.yml
+ansible-playbook -e @secrets.yml 09-audit.yml
 ```
 A la demande : `--tags snapshot` (snapshot `avant-modif`) et `--tags backup-now` (vzdump manuel) sur le playbook 03.
 
